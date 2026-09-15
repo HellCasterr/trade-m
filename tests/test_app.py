@@ -21,11 +21,17 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
         dashboard = client.get("/")
         assert dashboard.status_code == 200
         assert "Trade M" in dashboard.text
+        assert "Add all constituents" in dashboard.text
+        assert "Sign in with Upstox" in dashboard.text
+        assert "Sign in with Dhan" in dashboard.text
 
         status = client.get("/api/status").json()
         assert status["kite_configured"] is False
         assert status["authenticated"] is False
         assert status["monitor"]["connected"] is False
+        assert status["providers"]["zerodha"]["configured"] is False
+        assert status["providers"]["upstox"]["configured"] is False
+        assert status["providers"]["dhan"]["configured"] is False
 
         assert client.get("/api/rules").json() == []
         assert client.get("/api/events").json() == []

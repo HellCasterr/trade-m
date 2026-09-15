@@ -25,6 +25,8 @@ def _kite_classes() -> tuple[type[Any], type[Any]]:
 
 
 class KiteGateway:
+    provider = "zerodha"
+
     def __init__(self, api_key: str, api_secret: str) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
@@ -33,6 +35,7 @@ class KiteGateway:
         self.user_name: str | None = None
         self._instruments: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.RLock()
+        self._last_historical_request = 0.0
 
     def _new_client(self) -> Any:
         KiteConnect, _ = _kite_classes()
@@ -108,6 +111,11 @@ class KiteGateway:
         self, instrument_token: int, trading_date: date
     ) -> tuple[date, Decimal]:
         client = self.require_client()
+        with self._lock:
+            wait = 0.36 - (time_module.monotonic() - self._last_historical_request)
+            if wait > 0:
+                time_module.sleep(wait)
+            self._last_historical_request = time_module.monotonic()
         from_date = datetime.combine(trading_date - timedelta(days=14), datetime.min.time())
         to_date = datetime.combine(trading_date - timedelta(days=1), datetime.max.time())
         candles = client.historical_data(
@@ -125,7 +133,8 @@ class KiteGateway:
                 eligible.append((timestamp, candle))
         if not eligible:
             raise KiteUnavailable(
-                "No prior three-minute candle was returned. Check the symbol and historical-data subscription."
+                "No prior three-minute candle was returned. Check the symbol and "
+                "historical-data subscription."
             )
         timestamp, final_candle = max(eligible, key=lambda value: value[0])
         return timestamp.date(), as_decimal(final_candle["close"])
@@ -140,6 +149,7 @@ class LiveMonitor:
         finalization_delay_seconds: int,
         on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        self.provider = "zerodha"
         self.api_key = api_key
         self.store = store
         self.finalization_delay_seconds = finalization_delay_seconds
@@ -150,7 +160,7 @@ class LiveMonitor:
         self.running = False
         self.last_error: str | None = None
         self.last_tick_at: datetime | None = None
-        self.last_prices: dict[int, Decimal] = {}
+        self.last_prices: dict[int | str, Decimal] = {}
         self._lock = threading.RLock()
         self._finalizer_thread: threading.Thread | None = None
 
@@ -205,8 +215,10 @@ class LiveMonitor:
             ticker = self.ticker
             connected = self.connected
         if ticker is not None and connected and unique_tokens:
-            ticker.subscribe(unique_tokens)
-            ticker.set_mode(ticker.MODE_FULL, unique_tokens)
+            for start in range(0, len(unique_tokens), 500):
+                batch = unique_tokens[start : start + 500]
+                ticker.subscribe(batch)
+                ticker.set_mode(ticker.MODE_FULL, batch)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -224,11 +236,16 @@ class LiveMonitor:
             self.last_error = None
         tokens = [
             int(rule["instrument_token"])
-            for rule in self.store.active_rules(datetime.now(IST).date())
+            for rule in self.store.active_rules(
+                datetime.now(IST).date(), provider=self.provider
+            )
         ]
         if tokens:
-            ws.subscribe(sorted(set(tokens)))
-            ws.set_mode(ws.MODE_FULL, sorted(set(tokens)))
+            unique_tokens = sorted(set(tokens))
+            for start in range(0, len(unique_tokens), 500):
+                batch = unique_tokens[start : start + 500]
+                ws.subscribe(batch)
+                ws.set_mode(ws.MODE_FULL, batch)
 
     def _on_ticks(self, ws: Any, ticks: list[dict[str, Any]]) -> None:
         now = datetime.now(IST)
@@ -262,7 +279,7 @@ class LiveMonitor:
 
     def _process(self, candles: list[Candle]) -> None:
         for candle in candles:
-            for event in self.store.evaluate_candle(candle):
+            for event in self.store.evaluate_candle(candle, provider=self.provider):
                 self.on_event(event)
 
     def _on_close(self, ws: Any, code: int, reason: str) -> None:
@@ -286,7 +303,7 @@ class LiveMonitor:
 
 
 def create_daily_rule(
-    gateway: KiteGateway,
+    gateway: Any,
     store: Store,
     *,
     exchange: str,
@@ -295,7 +312,9 @@ def create_daily_rule(
     trading_date: date,
 ) -> dict[str, Any]:
     instrument = gateway.resolve_instrument(exchange, tradingsymbol)
-    token = int(instrument["instrument_token"])
+    token: int | str = instrument["instrument_token"]
+    if gateway.provider == "zerodha":
+        token = int(token)
     reference_date, reference_close = gateway.previous_session_close(token, trading_date)
     upper, lower = calculate_levels(reference_close, percentage)
     rule_id = store.upsert_rule(
@@ -308,6 +327,7 @@ def create_daily_rule(
         reference_close=reference_close,
         upper_level=upper,
         lower_level=lower,
+        provider=gateway.provider,
     )
     result = store.get_rule(rule_id)
     if result is None:

@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+import json
+import threading
+import time as time_module
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from .domain import Candle, CandleAggregator, IST, as_decimal, ensure_ist
+from .kite_service import KiteUnavailable
+from .storage import Store
+
+
+def _upstox_module() -> Any:
+    try:
+        import upstox_client
+    except ImportError as exc:
+        raise KiteUnavailable(
+            "upstox-python-sdk is not installed. Run setup_windows.bat again."
+        ) from exc
+    return upstox_client
+
+
+class UpstoxGateway:
+    provider = "upstox"
+
+    def __init__(self, api_key: str, api_secret: str, redirect_url: str) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.redirect_url = redirect_url
+        self.access_token: str | None = None
+        self.user_name: str | None = None
+        self.api_client: Any | None = None
+        self._lock = threading.RLock()
+        self._last_historical_request = 0.0
+
+    def login_url(self) -> str:
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": self.api_key,
+                "redirect_uri": self.redirect_url,
+            }
+        )
+        return f"https://api.upstox.com/v2/login/authorization/dialog?{query}"
+
+    def authenticate(self, code: str) -> dict[str, Any]:
+        body = urlencode(
+            {
+                "code": code,
+                "client_id": self.api_key,
+                "client_secret": self.api_secret,
+                "redirect_uri": self.redirect_url,
+                "grant_type": "authorization_code",
+            }
+        ).encode()
+        request = Request(
+            "https://api.upstox.com/v2/login/authorization/token",
+            data=body,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                session = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise KiteUnavailable(f"Upstox token exchange failed ({exc.code}): {detail}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise KiteUnavailable(f"Upstox token exchange failed: {exc}") from exc
+
+        access_token = session.get("access_token")
+        if not access_token:
+            raise KiteUnavailable("Upstox did not return an access token.")
+        upstox = _upstox_module()
+        configuration = upstox.Configuration()
+        configuration.access_token = access_token
+        with self._lock:
+            self.access_token = str(access_token)
+            self.api_client = upstox.ApiClient(configuration)
+            self.user_name = str(session.get("user_name") or "Upstox user")
+        return session
+
+    @property
+    def authenticated(self) -> bool:
+        return self.api_client is not None and bool(self.access_token)
+
+    def require_client(self) -> Any:
+        if self.api_client is None:
+            raise KiteUnavailable("Sign in to Upstox before using its market data.")
+        return self.api_client
+
+    @staticmethod
+    def _normalise_instrument(item: Any, exchange: str) -> dict[str, Any]:
+        if not isinstance(item, dict) and hasattr(item, "to_dict"):
+            item = item.to_dict()
+        if not isinstance(item, dict):
+            raise KiteUnavailable("Upstox returned an unsupported instrument record.")
+        return {
+            "exchange": exchange,
+            "tradingsymbol": str(
+                item.get("trading_symbol") or item.get("tradingsymbol") or ""
+            ),
+            "name": str(item.get("name") or item.get("short_name") or ""),
+            "instrument_token": str(
+                item.get("instrument_key") or item.get("instrument_token") or ""
+            ),
+        }
+
+    def search_instruments(self, query: str, exchange: str = "NSE") -> list[dict[str, Any]]:
+        upstox = _upstox_module()
+        response = upstox.InstrumentsApi(self.require_client()).search_instrument(
+            query.strip(),
+            exchanges=exchange.upper(),
+            segments="EQ",
+            instrument_types="EQ",
+            records=20,
+        )
+        results: list[dict[str, Any]] = []
+        for item in response.data or []:
+            normalised = self._normalise_instrument(item, exchange.upper())
+            if normalised["tradingsymbol"] and normalised["instrument_token"]:
+                results.append(normalised)
+        return results
+
+    def resolve_instrument(self, exchange: str, tradingsymbol: str) -> dict[str, Any]:
+        target = tradingsymbol.strip().upper()
+        for item in self.search_instruments(target, exchange):
+            if item["tradingsymbol"].upper() == target:
+                return item
+        raise KiteUnavailable(
+            f"No exact {exchange.upper()}:{target} instrument was found on Upstox."
+        )
+
+    def previous_session_close(
+        self, instrument_token: str, trading_date: date
+    ) -> tuple[date, Decimal]:
+        with self._lock:
+            wait = 0.15 - (time_module.monotonic() - self._last_historical_request)
+            if wait > 0:
+                time_module.sleep(wait)
+            self._last_historical_request = time_module.monotonic()
+        upstox = _upstox_module()
+        history = upstox.HistoryV3Api(self.require_client())
+        from_date = (trading_date - timedelta(days=14)).isoformat()
+        to_date = (trading_date - timedelta(days=1)).isoformat()
+        response = history.get_historical_candle_data1(
+            instrument_token, "minutes", "3", to_date, from_date
+        )
+        eligible: list[tuple[datetime, list[Any]]] = []
+        for candle in response.data.candles or []:
+            timestamp = ensure_ist(datetime.fromisoformat(str(candle[0]).replace("Z", "+00:00")))
+            if timestamp.date() < trading_date:
+                eligible.append((timestamp, candle))
+        if not eligible:
+            raise KiteUnavailable(
+                "No prior Upstox three-minute candle was returned for this instrument."
+            )
+        timestamp, final_candle = max(eligible, key=lambda value: value[0])
+        return timestamp.date(), as_decimal(final_candle[4])
+
+
+class UpstoxMonitor:
+    provider = "upstox"
+
+    def __init__(
+        self,
+        *,
+        gateway: UpstoxGateway,
+        store: Store,
+        finalization_delay_seconds: int,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.gateway = gateway
+        self.store = store
+        self.finalization_delay_seconds = finalization_delay_seconds
+        self.on_event = on_event or (lambda event: None)
+        self.aggregator = CandleAggregator()
+        self.streamer: Any | None = None
+        self.connected = False
+        self.running = False
+        self.last_error: str | None = None
+        self.last_tick_at: datetime | None = None
+        self.last_prices: dict[int | str, Decimal] = {}
+        self._lock = threading.RLock()
+        self._finalizer_thread: threading.Thread | None = None
+
+    def start(self, access_token: str) -> None:
+        if not access_token:
+            raise KiteUnavailable("Upstox access token is missing.")
+        upstox = _upstox_module()
+        with self._lock:
+            if self.streamer is not None:
+                try:
+                    self.streamer.disconnect()
+                except Exception:
+                    pass
+            streamer = upstox.MarketDataStreamerV3(self.gateway.require_client())
+            streamer.auto_reconnect(True, 5, 50)
+            streamer.on("open", self._on_open)
+            streamer.on("message", self._on_message)
+            streamer.on("close", self._on_close)
+            streamer.on("error", self._on_error)
+            streamer.on("reconnecting", self._on_reconnecting)
+            streamer.on("autoReconnectStopped", self._on_reconnect_stopped)
+            self.streamer = streamer
+            self.running = True
+            self.last_error = None
+            if not self._finalizer_thread or not self._finalizer_thread.is_alive():
+                self._finalizer_thread = threading.Thread(
+                    target=self._finalizer_loop,
+                    name="trade-m-upstox-candle-finalizer",
+                    daemon=True,
+                )
+                self._finalizer_thread.start()
+        streamer.connect()
+
+    def stop(self) -> None:
+        with self._lock:
+            self.running = False
+            streamer = self.streamer
+            self.streamer = None
+            self.connected = False
+        if streamer is not None:
+            try:
+                streamer.disconnect()
+            except Exception:
+                pass
+
+    def subscribe(self, tokens: list[int | str]) -> None:
+        keys = sorted(set(str(token) for token in tokens))
+        with self._lock:
+            streamer = self.streamer
+            connected = self.connected
+        if streamer is not None and connected:
+            for start in range(0, len(keys), 500):
+                streamer.subscribe(keys[start : start + 500], "ltpc")
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "running": self.running,
+                "connected": self.connected,
+                "last_error": self.last_error,
+                "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+                "last_prices": {str(key): str(value) for key, value in self.last_prices.items()},
+            }
+
+    def _on_open(self) -> None:
+        with self._lock:
+            self.connected = True
+            self.last_error = None
+        keys = [
+            rule["instrument_token"]
+            for rule in self.store.active_rules(datetime.now(IST).date(), provider=self.provider)
+        ]
+        self.subscribe(keys)
+
+    def _on_message(self, message: dict[str, Any]) -> None:
+        now = datetime.now(IST)
+        completed: list[Candle] = []
+        with self._lock:
+            for key, feed in (message.get("feeds") or {}).items():
+                try:
+                    ltpc = feed.get("ltpc") or feed.get("fullFeed", {}).get(
+                        "marketFF", {}
+                    ).get("ltpc")
+                    if not ltpc:
+                        continue
+                    price = as_decimal(ltpc["ltp"])
+                    raw_timestamp = ltpc.get("ltt")
+                    timestamp = (
+                        datetime.fromtimestamp(int(raw_timestamp) / 1000, tz=UTC).astimezone(IST)
+                        if raw_timestamp
+                        else now
+                    )
+                    self.last_prices[key] = price
+                    self.last_tick_at = now
+                    completed.extend(self.aggregator.add_tick(key, price, timestamp))
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.last_error = f"Ignored invalid Upstox tick: {exc}"
+        self._process(completed)
+
+    def _finalizer_loop(self) -> None:
+        while self.running:
+            with self._lock:
+                completed = self.aggregator.finalize_due(
+                    datetime.now(IST), self.finalization_delay_seconds
+                )
+            self._process(completed)
+            time_module.sleep(0.5)
+
+    def _process(self, candles: list[Candle]) -> None:
+        for candle in candles:
+            for event in self.store.evaluate_candle(candle, provider=self.provider):
+                self.on_event(event)
+
+    def _on_close(self, code: int, reason: str) -> None:
+        with self._lock:
+            self.connected = False
+            if self.running:
+                self.last_error = f"Upstox WebSocket closed ({code}): {reason}"
+
+    def _on_error(self, error: Any) -> None:
+        with self._lock:
+            self.last_error = f"Upstox WebSocket error: {error}"
+
+    def _on_reconnecting(self, message: str) -> None:
+        with self._lock:
+            self.last_error = str(message)
+
+    def _on_reconnect_stopped(self, message: str) -> None:
+        with self._lock:
+            self.connected = False
+            self.last_error = f"Upstox reconnect stopped: {message}"

@@ -82,3 +82,35 @@ def test_rule_update_resets_directional_state(tmp_path) -> None:
     rule = store.get_rule(rule_id)
     assert rule["percentage"] == "2"
     assert rule["upper_sent"] is False
+
+
+def test_provider_isolates_same_instrument_identifier(tmp_path) -> None:
+    store = make_store(tmp_path)
+    add_example_rule(store)
+    upper, lower = calculate_levels(Decimal("365.20"), Decimal("1.43"))
+    store.upsert_rule(
+        exchange="NSE",
+        tradingsymbol="UPSTOXTEST",
+        instrument_token=884737,
+        trading_date=date(2026, 9, 15),
+        percentage=Decimal("1.43"),
+        reference_date=date(2026, 9, 14),
+        reference_close=Decimal("365.20"),
+        upper_level=upper,
+        lower_level=lower,
+        provider="upstox",
+    )
+    created = store.evaluate_candle(candle("369", "372"), provider="upstox")
+    assert [event["tradingsymbol"] for event in created] == ["UPSTOXTEST"]
+
+
+def test_percentage_edit_and_bulk_pause(tmp_path) -> None:
+    store = make_store(tmp_path)
+    rule_id = add_example_rule(store)
+    updated = store.update_rule_percentage(rule_id, Decimal("2"))
+    assert updated is not None
+    assert updated["percentage"] == "2"
+    assert updated["upper_level"] == "372.5040"
+    assert store.set_rules_active(date(2026, 9, 15), False) == 1
+    assert store.daily_rules(date(2026, 9, 15))[0]["active"] is False
+    assert store.active_rules(date(2026, 9, 15)) == []

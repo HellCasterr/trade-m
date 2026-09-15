@@ -25,7 +25,7 @@ if errorlevel 1 goto :failed
 if not exist ".env" (
   copy ".env.example" ".env" >nul
   echo.
-  echo Created .env. Open it in Notepad and enter your Kite API key and secret.
+  echo Created .env. Open it in Notepad and enter your Zerodha, Upstox, and/or Dhan credentials.
 ) else (
   echo Existing .env kept unchanged.
 )

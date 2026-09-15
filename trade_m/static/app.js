@@ -1,9 +1,10 @@
 const state = {
   rules: [],
   events: [],
+  niftySymbols: [],
+  providers: {},
   lastEventId: Number(localStorage.getItem("tradeM.lastEventId") || 0),
   eventsLoaded: false,
-  authenticated: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -12,7 +13,7 @@ function showMessage(text, kind = "info") {
   const node = $("#message");
   node.textContent = text;
   node.className = `message ${kind}`;
-  window.setTimeout(() => node.classList.add("hidden"), 7000);
+  window.setTimeout(() => node.classList.add("hidden"), 9000);
 }
 
 async function api(path, options = {}) {
@@ -34,43 +35,63 @@ function formatTime(iso) {
   }).format(new Date(iso));
 }
 
+function providerTitle(name) {
+  return { zerodha: "Zerodha", upstox: "Upstox", dhan: "DhanHQ" }[name] || name;
+}
+
+function renderProviderStatus(name, status) {
+  const title = providerTitle(name);
+  const copy = $(`#${name}Copy`);
+  const button = $(`#${name}Button`);
+  if (!status.configured) {
+    copy.textContent = `Add ${title.toUpperCase()} API credentials to .env, then restart.`;
+    button.textContent = "Configuration required";
+    button.classList.add("disabled");
+  } else if (status.authenticated) {
+    const feed = status.monitor.connected ? "Live feed connected." : "Signed in; feed connecting.";
+    copy.textContent = `${feed}${status.user_name ? ` Account: ${status.user_name}.` : ""}`;
+    button.textContent = `Reconnect ${title}`;
+    button.classList.remove("disabled");
+  } else {
+    copy.textContent = `Configured. Sign in before using ${title} data.`;
+    button.textContent = `Sign in with ${title}`;
+    button.classList.remove("disabled");
+  }
+}
+
 function renderStatus(status) {
-  state.authenticated = status.authenticated;
+  state.providers = status.providers || {};
   const market = $("#marketBadge");
   market.textContent = status.market_open ? "Market session open" : "Market session closed";
   market.className = `badge ${status.market_open ? "good" : "neutral"}`;
 
+  const connected = Object.entries(state.providers)
+    .filter(([, value]) => value.monitor.connected)
+    .map(([name]) => providerTitle(name));
   const feed = $("#feedBadge");
-  feed.textContent = status.monitor.connected ? "Live feed connected" : "Feed disconnected";
-  feed.className = `badge ${status.monitor.connected ? "good" : "warn"}`;
+  feed.textContent = connected.length ? `${connected.join(" + ")} live` : "Feeds disconnected";
+  feed.className = `badge ${connected.length ? "good" : "warn"}`;
   $("#serverTime").textContent = `IST ${formatTime(status.server_time)}`;
 
-  const loginButton = $("#loginButton");
-  const loginCopy = $("#loginCopy");
-  if (!status.kite_configured) {
-    loginCopy.textContent = "Add KITE_API_KEY and KITE_API_SECRET to .env, then restart the app.";
-    loginButton.textContent = "Configuration required";
-    loginButton.classList.add("disabled");
-  } else if (status.authenticated) {
-    loginCopy.textContent = `Connected${status.user_name ? ` as ${status.user_name}` : ""}. The session expires by the next morning.`;
-    loginButton.textContent = "Reconnect Zerodha";
-    loginButton.classList.remove("disabled");
+  for (const name of ["zerodha", "upstox", "dhan"]) {
+    if (state.providers[name]) renderProviderStatus(name, state.providers[name]);
+    const error = state.providers[name]?.monitor?.last_error;
+    if (error) showMessage(error, "warn");
   }
-  if (status.monitor.last_error) showMessage(status.monitor.last_error, "warn");
 }
 
 function renderRules() {
   const container = $("#rules");
   if (!state.rules.length) {
     container.className = "rules-list empty-state";
-    container.textContent = "No active rules yet.";
+    container.textContent = "No rules configured today.";
     return;
   }
   container.className = "rules-list";
   container.innerHTML = state.rules.map(rule => `
-    <article class="rule-row">
+    <article class="rule-row ${rule.active ? "" : "paused"}">
       <div class="symbol-block">
-        <span class="exchange">${rule.exchange}</span>
+        <span class="exchange">${rule.exchange} · ${rule.provider.toUpperCase()}</span>
         <strong>${rule.tradingsymbol}</strong>
         <small>Reference ${rule.reference_date} · ₹${rule.reference_close_display}</small>
       </div>
@@ -84,7 +105,17 @@ function renderRules() {
         <strong>₹${rule.lower_level_display}</strong>
         <span class="pill ${rule.lower_sent ? "triggered" : "waiting"}">${rule.lower_sent ? "Alerted" : "Waiting"}</span>
       </div>
-      <button class="icon-button" data-delete="${rule.id}" title="Stop monitoring">×</button>
+      <div class="rule-actions">
+        <label>Daily %
+          <div class="inline-percent">
+            <input data-percentage="${rule.id}" type="number" min="0.01" max="50" step="0.01" value="${rule.percentage}">
+            <button class="mini-button" data-save="${rule.id}">Save</button>
+          </div>
+        </label>
+        <button class="mini-button ${rule.active ? "pause" : "start"}" data-active="${rule.id}" data-next="${!rule.active}">
+          ${rule.active ? "Pause" : "Start"}
+        </button>
+      </div>
     </article>`).join("");
 }
 
@@ -97,7 +128,7 @@ function eventBody(event) {
 }
 
 function notify(event) {
-  if (Notification.permission !== "granted") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
   const notification = new Notification(eventTitle(event), {
     body: eventBody(event),
     tag: `trade-m-${event.id}`,
@@ -118,7 +149,7 @@ function renderEvents() {
     <article class="event-row">
       <span class="event-dot ${event.direction.toLowerCase()}"></span>
       <div><strong>${eventTitle(event)}</strong><p>${eventBody(event)}</p></div>
-      <time>${formatTime(event.created_at)}</time>
+      <time>${event.provider?.toUpperCase() || ""} · ${formatTime(event.created_at)}</time>
     </article>`).join("");
 }
 
@@ -150,14 +181,15 @@ let searchTimer;
 $("#symbol").addEventListener("input", () => {
   clearTimeout(searchTimer);
   const query = $("#symbol").value.trim();
-  if (!state.authenticated || query.length < 2) {
+  const provider = $("#provider").value;
+  if (!state.providers[provider]?.authenticated || query.length < 2) {
     $("#suggestions").classList.add("hidden");
     return;
   }
   searchTimer = setTimeout(async () => {
     try {
       const exchange = $("#exchange").value;
-      const results = await api(`/api/instruments/search?q=${encodeURIComponent(query)}&exchange=${exchange}`);
+      const results = await api(`/api/instruments/search?q=${encodeURIComponent(query)}&exchange=${exchange}&provider=${provider}`);
       const box = $("#suggestions");
       box.innerHTML = results.map(item => `
         <button type="button" data-symbol="${item.tradingsymbol}">
@@ -184,18 +216,26 @@ $("#notificationButton").addEventListener("click", async () => {
   $("#notificationCopy").textContent = permission === "granted"
     ? "Desktop alerts are enabled. Keep this page open during market hours."
     : "Notifications were not allowed. Enable them in the browser site settings.";
-  if (permission === "granted") new Notification("Trade M is ready", { body: "Live crossing alerts are enabled." });
+  if (permission === "granted") {
+    new Notification("Trade M is ready", { body: "Live crossing alerts are enabled." });
+  }
 });
 
 $("#ruleForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.submitter;
+  const provider = $("#provider").value;
+  if (!state.providers[provider]?.authenticated) {
+    showMessage(`Sign in to ${providerTitle(provider)} first.`, "error");
+    return;
+  }
   button.disabled = true;
   button.textContent = "Calculating…";
   try {
     await api("/api/rules", {
       method: "POST",
       body: JSON.stringify({
+        provider,
         exchange: $("#exchange").value,
         tradingsymbol: $("#symbol").value,
         percentage: $("#percentage").value,
@@ -212,19 +252,118 @@ $("#ruleForm").addEventListener("submit", async (event) => {
   }
 });
 
-$("#rules").addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-delete]");
-  if (!button || !confirm("Stop monitoring this rule for today?")) return;
+function renderNiftyRows(symbols) {
+  const common = $("#niftyPercentage").value;
+  $("#niftyRows").innerHTML = symbols.map(symbol => `
+    <tr>
+      <td><strong>${symbol}</strong></td>
+      <td><div class="percent-wrap table-percent"><input data-nifty-symbol="${symbol}" type="number" min="0.01" max="50" step="0.01" value="${common}"><span>%</span></div></td>
+    </tr>`).join("");
+  $("#niftyTableWrap").classList.remove("hidden");
+  $("#addNiftyButton").classList.remove("hidden");
+}
+
+$("#loadNiftyButton").addEventListener("click", async () => {
+  const button = $("#loadNiftyButton");
+  button.disabled = true;
+  button.textContent = "Loading…";
   try {
-    await api(`/api/rules/${button.dataset.delete}`, { method: "DELETE" });
-    showMessage("Monitoring stopped.", "success");
+    const result = await api("/api/nifty50?refresh=true");
+    state.niftySymbols = result.symbols;
+    renderNiftyRows(result.symbols);
+    $("#niftySource").textContent = `${result.count} constituents · Source: ${result.source}`;
+  } catch (error) { showMessage(error.message, "error"); }
+  finally {
+    button.disabled = false;
+    button.textContent = "Reload Nifty 50";
+  }
+});
+
+$("#niftyPercentage").addEventListener("change", () => {
+  const value = $("#niftyPercentage").value;
+  document.querySelectorAll("input[data-nifty-symbol]").forEach(input => { input.value = value; });
+});
+
+$("#addNiftyButton").addEventListener("click", async () => {
+  const provider = $("#niftyProvider").value;
+  const common = $("#niftyPercentage").value;
+  if (!state.providers[provider]?.authenticated) {
+    showMessage(`Sign in to ${providerTitle(provider)} first.`, "error");
+    return;
+  }
+  if (!common) {
+    showMessage("Enter the common percentage first.", "error");
+    return;
+  }
+  const percentages = {};
+  for (const input of document.querySelectorAll("input[data-nifty-symbol]")) {
+    if (!input.value) {
+      showMessage(`Enter a percentage for ${input.dataset.niftySymbol}.`, "error");
+      return;
+    }
+    percentages[input.dataset.niftySymbol] = input.value;
+  }
+  const button = $("#addNiftyButton");
+  button.disabled = true;
+  button.textContent = "Fetching 50 reference closes…";
+  try {
+    const result = await api("/api/rules/nifty50", {
+      method: "POST",
+      body: JSON.stringify({ provider, common_percentage: common, percentages }),
+    });
+    const failureNames = result.failures.slice(0, 4).map(item => item.symbol).join(", ");
+    const suffix = result.failed ? ` ${result.failed} failed${failureNames ? `: ${failureNames}` : ""}.` : "";
+    showMessage(`${result.created} Nifty rules are active.${suffix}`, result.failed ? "warn" : "success");
+    await refresh();
+  } catch (error) { showMessage(error.message, "error"); }
+  finally {
+    button.disabled = false;
+    button.textContent = "Add all 50";
+  }
+});
+
+$("#rules").addEventListener("click", async (event) => {
+  const save = event.target.closest("button[data-save]");
+  const toggle = event.target.closest("button[data-active]");
+  try {
+    if (save) {
+      const input = document.querySelector(`input[data-percentage="${save.dataset.save}"]`);
+      await api(`/api/rules/${save.dataset.save}`, {
+        method: "PATCH", body: JSON.stringify({ percentage: input.value })
+      });
+      showMessage("Percentage and levels updated for today.", "success");
+    } else if (toggle) {
+      const active = toggle.dataset.next === "true";
+      await api(`/api/rules/${toggle.dataset.active}`, {
+        method: "PATCH", body: JSON.stringify({ active })
+      });
+      showMessage(active ? "Monitoring started." : "Monitoring paused.", "success");
+    } else {
+      return;
+    }
     await refresh();
   } catch (error) { showMessage(error.message, "error"); }
 });
 
+async function setAllRules(active) {
+  try {
+    const result = await api("/api/rules/bulk-status", {
+      method: "POST", body: JSON.stringify({ active })
+    });
+    showMessage(`${result.affected} rules ${active ? "started" : "paused"}.`, "success");
+    await refresh();
+  } catch (error) { showMessage(error.message, "error"); }
+}
+
+$("#startAllButton").addEventListener("click", () => setAllRules(true));
+$("#pauseAllButton").addEventListener("click", () => setAllRules(false));
+
 const query = new URLSearchParams(window.location.search);
 if (query.get("error")) showMessage(query.get("error"), "error");
-if (query.get("login") === "success") showMessage("Zerodha connected successfully.", "success");
+if (query.get("login")) {
+  const provider = providerTitle(query.get("login"));
+  showMessage(`${provider} connected successfully.`, "success");
+}
 history.replaceState({}, "", "/");
 
 if ("Notification" in window && Notification.permission === "granted") {

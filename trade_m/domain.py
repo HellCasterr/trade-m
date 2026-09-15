@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from typing import TypeAlias
 from zoneinfo import ZoneInfo
 
 
@@ -11,6 +12,7 @@ SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
 THREE_MINUTES = timedelta(minutes=3)
 DISPLAY_QUANTUM = Decimal("0.01")
+InstrumentKey: TypeAlias = int | str
 
 
 def as_decimal(value: object) -> Decimal:
@@ -56,7 +58,7 @@ def bucket_start(timestamp: datetime) -> datetime | None:
 
 @dataclass
 class Candle:
-    instrument_token: int
+    instrument_token: InstrumentKey
     start: datetime
     end: datetime
     open: Decimal
@@ -65,7 +67,9 @@ class Candle:
     close: Decimal
 
     @classmethod
-    def from_tick(cls, instrument_token: int, price: Decimal, timestamp: datetime) -> "Candle":
+    def from_tick(
+        cls, instrument_token: InstrumentKey, price: Decimal, timestamp: datetime
+    ) -> "Candle":
         start = bucket_start(timestamp)
         if start is None:
             raise ValueError("Tick is outside the regular market session")
@@ -92,11 +96,11 @@ class CandleAggregator:
     """Aggregates exchange-timestamped ticks into aligned three-minute candles."""
 
     def __init__(self) -> None:
-        self._current: dict[int, Candle] = {}
-        self._last_finalized_end: dict[int, datetime] = {}
+        self._current: dict[InstrumentKey, Candle] = {}
+        self._last_finalized_end: dict[InstrumentKey, datetime] = {}
 
     def add_tick(
-        self, instrument_token: int, price: Decimal, timestamp: datetime
+        self, instrument_token: InstrumentKey, price: Decimal, timestamp: datetime
     ) -> list[Candle]:
         start = bucket_start(timestamp)
         if start is None:
@@ -133,7 +137,7 @@ class CandleAggregator:
                     due.append(finalized)
         return due
 
-    def _finalize(self, instrument_token: int) -> Candle | None:
+    def _finalize(self, instrument_token: InstrumentKey) -> Candle | None:
         candle = self._current.pop(instrument_token, None)
         if candle is not None:
             self._last_finalized_end[instrument_token] = candle.end

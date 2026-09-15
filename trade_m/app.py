@@ -7,45 +7,125 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import Settings, get_settings
+from .dhan_service import DhanGateway, DhanMonitor
 from .domain import IST, SESSION_CLOSE, SESSION_OPEN
 from .kite_service import KiteGateway, KiteUnavailable, LiveMonitor, create_daily_rule
+from .nifty50 import Nifty50Service
 from .storage import Store
+from .upstox_service import UpstoxGateway, UpstoxMonitor
 
 
 class RuleInput(BaseModel):
+    provider: str = "zerodha"
     exchange: str
     tradingsymbol: str
     percentage: Decimal
 
 
+class RulePatch(BaseModel):
+    percentage: Decimal | None = None
+    active: bool | None = None
+
+
+class NiftyBulkInput(BaseModel):
+    provider: str = "zerodha"
+    common_percentage: Decimal
+    percentages: dict[str, Decimal] = Field(default_factory=dict)
+
+
+class BulkStatusInput(BaseModel):
+    active: bool
+    rule_ids: list[int] | None = None
+
+
+def _percentage(value: Decimal) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise HTTPException(status_code=400, detail="Enter a valid percentage.") from exc
+    if result <= 0 or result > 50:
+        raise HTTPException(
+            status_code=400, detail="Percentage must be greater than 0 and at most 50."
+        )
+    return result
+
+
 def build_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     store = Store(settings.database_path)
-    gateway = KiteGateway(settings.api_key, settings.api_secret)
-    monitor = LiveMonitor(
-        api_key=settings.api_key,
-        store=store,
-        finalization_delay_seconds=settings.candle_finalization_delay_seconds,
+    kite_gateway = KiteGateway(settings.api_key, settings.api_secret)
+    upstox_gateway = UpstoxGateway(
+        settings.upstox_api_key,
+        settings.upstox_api_secret,
+        settings.upstox_redirect_url,
     )
+    dhan_gateway = DhanGateway(
+        settings.dhan_client_id,
+        settings.dhan_api_key,
+        settings.dhan_api_secret,
+        settings.dhan_access_token,
+    )
+    gateways: dict[str, Any] = {
+        "zerodha": kite_gateway,
+        "upstox": upstox_gateway,
+        "dhan": dhan_gateway,
+    }
+    monitors: dict[str, Any] = {
+        "zerodha": LiveMonitor(
+            api_key=settings.api_key,
+            store=store,
+            finalization_delay_seconds=settings.candle_finalization_delay_seconds,
+        ),
+        "upstox": UpstoxMonitor(
+            gateway=upstox_gateway,
+            store=store,
+            finalization_delay_seconds=settings.candle_finalization_delay_seconds,
+        ),
+        "dhan": DhanMonitor(
+            gateway=dhan_gateway,
+            store=store,
+            finalization_delay_seconds=settings.candle_finalization_delay_seconds,
+        ),
+    }
+    nifty50 = Nifty50Service()
+
+    def provider_objects(provider: str) -> tuple[Any, Any]:
+        key = provider.strip().lower()
+        if key not in gateways:
+            raise HTTPException(
+                status_code=400, detail="Provider must be zerodha, upstox, or dhan."
+            )
+        return gateways[key], monitors[key]
+
+    def subscribe_active_rules() -> None:
+        today = datetime.now(IST).date()
+        for provider, monitor in monitors.items():
+            tokens = [
+                rule["instrument_token"]
+                for rule in store.active_rules(today, provider=provider)
+            ]
+            monitor.subscribe(tokens)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
-        monitor.stop()
+        for monitor in monitors.values():
+            monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.1.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.3.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store
-    app.state.gateway = gateway
-    app.state.monitor = monitor
+    app.state.gateways = gateways
+    app.state.monitors = monitors
+    app.state.nifty50 = nifty50
 
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -55,16 +135,18 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(static_dir / "index.html")
 
     @app.get("/auth/login", include_in_schema=False)
-    def login() -> RedirectResponse:
+    def kite_login() -> RedirectResponse:
         if not settings.kite_configured:
-            return RedirectResponse("/?error=" + quote("Add your Kite API key and secret to .env first."))
+            return RedirectResponse(
+                "/?error=" + quote("Add your Kite API key and secret to .env first.")
+            )
         try:
-            return RedirectResponse(gateway.login_url())
+            return RedirectResponse(kite_gateway.login_url())
         except KiteUnavailable as exc:
             return RedirectResponse("/?error=" + quote(str(exc)))
 
     @app.get("/auth/callback", include_in_schema=False)
-    def auth_callback(
+    def kite_auth_callback(
         request_token: str | None = None,
         status: str | None = None,
         action: str | None = None,
@@ -72,13 +154,65 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         if status == "cancelled" or action == "logout":
             return RedirectResponse("/?error=" + quote("Zerodha login was cancelled."))
         if not request_token:
-            return RedirectResponse("/?error=" + quote("Zerodha did not return a request token."))
+            return RedirectResponse(
+                "/?error=" + quote("Zerodha did not return a request token.")
+            )
         try:
-            gateway.authenticate(request_token)
-            monitor.start(gateway.access_token or "")
+            kite_gateway.authenticate(request_token)
+            monitors["zerodha"].start(kite_gateway.access_token or "")
         except Exception as exc:
             return RedirectResponse("/?error=" + quote(f"Zerodha login failed: {exc}"))
-        return RedirectResponse("/?login=success")
+        return RedirectResponse("/?login=zerodha")
+
+    @app.get("/auth/upstox/login", include_in_schema=False)
+    def upstox_login() -> RedirectResponse:
+        if not settings.upstox_configured:
+            return RedirectResponse(
+                "/?error=" + quote("Add your Upstox API key and secret to .env first.")
+            )
+        return RedirectResponse(upstox_gateway.login_url())
+
+    @app.get("/auth/upstox/callback", include_in_schema=False)
+    def upstox_auth_callback(code: str | None = None) -> RedirectResponse:
+        if not code:
+            return RedirectResponse("/?error=" + quote("Upstox did not return a login code."))
+        try:
+            upstox_gateway.authenticate(code)
+            monitors["upstox"].start(upstox_gateway.access_token or "")
+        except Exception as exc:
+            return RedirectResponse("/?error=" + quote(f"Upstox login failed: {exc}"))
+        return RedirectResponse("/?login=upstox")
+
+    @app.get("/auth/dhan/login", include_in_schema=False)
+    def dhan_login() -> RedirectResponse:
+        if not settings.dhan_configured:
+            return RedirectResponse(
+                "/?error="
+                + quote(
+                    "Add DHAN_CLIENT_ID and either DHAN_ACCESS_TOKEN or Dhan app "
+                    "credentials to .env first."
+                )
+            )
+        try:
+            login_url = dhan_gateway.login_url()
+            if dhan_gateway.authenticated:
+                monitors["dhan"].start(dhan_gateway.access_token or "")
+            return RedirectResponse(login_url)
+        except Exception as exc:
+            return RedirectResponse("/?error=" + quote(f"Dhan login failed: {exc}"))
+
+    @app.get("/auth/dhan/callback", include_in_schema=False)
+    def dhan_auth_callback(tokenId: str | None = None) -> RedirectResponse:  # noqa: N803
+        if not tokenId:
+            return RedirectResponse(
+                "/?error=" + quote("Dhan did not return a consent token ID.")
+            )
+        try:
+            dhan_gateway.authenticate(tokenId)
+            monitors["dhan"].start(dhan_gateway.access_token or "")
+        except Exception as exc:
+            return RedirectResponse("/?error=" + quote(f"Dhan login failed: {exc}"))
+        return RedirectResponse("/?login=dhan")
 
     @app.get("/api/status")
     def status() -> dict[str, Any]:
@@ -87,45 +221,71 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             now.weekday() < 5
             and SESSION_OPEN <= now.time().replace(tzinfo=None) < SESSION_CLOSE
         )
+        providers = {
+            "zerodha": {
+                "configured": settings.kite_configured,
+                "authenticated": kite_gateway.authenticated,
+                "user_name": kite_gateway.user_name,
+                "monitor": monitors["zerodha"].status(),
+            },
+            "upstox": {
+                "configured": settings.upstox_configured,
+                "authenticated": upstox_gateway.authenticated,
+                "user_name": upstox_gateway.user_name,
+                "monitor": monitors["upstox"].status(),
+            },
+            "dhan": {
+                "configured": settings.dhan_configured,
+                "authenticated": dhan_gateway.authenticated,
+                "user_name": dhan_gateway.user_name,
+                "monitor": monitors["dhan"].status(),
+            },
+        }
         return {
             "kite_configured": settings.kite_configured,
-            "authenticated": gateway.authenticated,
-            "user_name": gateway.user_name,
+            "authenticated": any(item["authenticated"] for item in providers.values()),
+            "user_name": kite_gateway.user_name,
             "market_open": market_open,
             "server_time": now.isoformat(),
-            "monitor": monitor.status(),
+            "monitor": providers["zerodha"]["monitor"],
+            "providers": providers,
         }
 
     @app.get("/api/instruments/search")
     def search_instruments(
         q: str = Query(min_length=1, max_length=40),
         exchange: str = Query(default="NSE", pattern="^(NSE|BSE)$"),
+        provider: str = Query(default="zerodha", pattern="^(zerodha|upstox|dhan)$"),
     ) -> list[dict[str, Any]]:
+        gateway, _ = provider_objects(provider)
         try:
             return gateway.search_instruments(q, exchange)
         except KiteUnavailable as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Instrument lookup failed: {exc}") from exc
+            raise HTTPException(
+                status_code=502, detail=f"{provider.title()} instrument lookup failed: {exc}"
+            ) from exc
+
+    @app.get("/api/nifty50")
+    def nifty_constituents(refresh: bool = False) -> dict[str, Any]:
+        result = nifty50.get(force_refresh=refresh)
+        return {"symbols": result.symbols, "count": len(result.symbols), "source": result.source}
 
     @app.get("/api/rules")
     def list_rules() -> list[dict[str, Any]]:
-        return store.active_rules(datetime.now(IST).date())
+        return store.daily_rules(datetime.now(IST).date())
 
     @app.post("/api/rules", status_code=201)
     def add_rule(payload: RuleInput) -> dict[str, Any]:
+        gateway, monitor = provider_objects(payload.provider)
         exchange = payload.exchange.strip().upper()
         symbol = payload.tradingsymbol.strip().upper()
         if exchange not in {"NSE", "BSE"}:
             raise HTTPException(status_code=400, detail="Exchange must be NSE or BSE.")
         if not symbol:
             raise HTTPException(status_code=400, detail="Trading symbol is required.")
-        try:
-            percentage = Decimal(str(payload.percentage))
-        except InvalidOperation as exc:
-            raise HTTPException(status_code=400, detail="Enter a valid percentage.") from exc
-        if percentage <= 0 or percentage > 50:
-            raise HTTPException(status_code=400, detail="Percentage must be greater than 0 and at most 50.")
+        percentage = _percentage(payload.percentage)
         try:
             rule = create_daily_rule(
                 gateway,
@@ -135,12 +295,75 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 percentage=percentage,
                 trading_date=datetime.now(IST).date(),
             )
-            monitor.subscribe([int(rule["instrument_token"])])
+            monitor.subscribe([rule["instrument_token"]])
             return rule
         except KiteUnavailable as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Could not create the rule: {exc}") from exc
+            raise HTTPException(
+                status_code=502, detail=f"Could not create the rule: {exc}"
+            ) from exc
+
+    @app.post("/api/rules/nifty50", status_code=201)
+    def add_nifty_rules(payload: NiftyBulkInput) -> dict[str, Any]:
+        gateway, monitor = provider_objects(payload.provider)
+        common = _percentage(payload.common_percentage)
+        overrides = {
+            symbol.strip().upper(): _percentage(value)
+            for symbol, value in payload.percentages.items()
+        }
+        constituent_result = nifty50.get()
+        created: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        today = datetime.now(IST).date()
+        for symbol in constituent_result.symbols:
+            try:
+                created.append(
+                    create_daily_rule(
+                        gateway,
+                        store,
+                        exchange="NSE",
+                        tradingsymbol=symbol,
+                        percentage=overrides.get(symbol, common),
+                        trading_date=today,
+                    )
+                )
+            except Exception as exc:
+                failures.append({"symbol": symbol, "error": str(exc)})
+        monitor.subscribe([rule["instrument_token"] for rule in created])
+        return {
+            "created": len(created),
+            "failed": len(failures),
+            "failures": failures,
+            "source": constituent_result.source,
+            "rules": created,
+        }
+
+    @app.patch("/api/rules/{rule_id}")
+    def update_rule(rule_id: int, payload: RulePatch) -> dict[str, Any]:
+        if payload.percentage is None and payload.active is None:
+            raise HTTPException(status_code=400, detail="No rule change was provided.")
+        if payload.percentage is not None:
+            rule = store.update_rule_percentage(rule_id, _percentage(payload.percentage))
+            if rule is None:
+                raise HTTPException(status_code=404, detail="Rule not found.")
+        if payload.active is not None and not store.set_rule_active(rule_id, payload.active):
+            raise HTTPException(status_code=404, detail="Rule not found.")
+        rule = store.get_rule(rule_id)
+        if rule is None:
+            raise HTTPException(status_code=404, detail="Rule not found.")
+        if rule["active"]:
+            monitors[rule["provider"]].subscribe([rule["instrument_token"]])
+        return rule
+
+    @app.post("/api/rules/bulk-status")
+    def bulk_rule_status(payload: BulkStatusInput) -> dict[str, Any]:
+        affected = store.set_rules_active(
+            datetime.now(IST).date(), payload.active, payload.rule_ids
+        )
+        if payload.active:
+            subscribe_active_rules()
+        return {"affected": affected, "active": payload.active}
 
     @app.delete("/api/rules/{rule_id}")
     def delete_rule(rule_id: int) -> dict[str, bool]:
@@ -150,7 +373,8 @@ def build_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/events")
     def events(
-        after_id: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=500)
+        after_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         return store.events_after(after_id, limit)
 
