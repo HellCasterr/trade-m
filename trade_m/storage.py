@@ -22,6 +22,9 @@ class Store:
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=15)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=15000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA synchronous=NORMAL")
         try:
             yield connection
             connection.commit()
@@ -230,7 +233,12 @@ class Store:
                     ("LOWER", Decimal(row["lower_level"]), bool(row["lower_sent"])),
                 )
                 for direction, threshold, already_sent in candidates:
-                    if already_sent or not candle.contains(threshold):
+                    crossed = (
+                        candle.crossed_down(threshold)
+                        if direction == "UPPER"
+                        else candle.crossed_up(threshold)
+                    )
+                    if already_sent or not crossed:
                         continue
                     now = datetime.now(UTC).isoformat(timespec="seconds")
                     try:

@@ -5,6 +5,7 @@ from decimal import Decimal
 from trade_m.dhan_service import (
     DhanGateway,
     DhanMonitor,
+    completed_candles_from_intraday,
     decode_instrument,
     encode_instrument,
     parse_ticker_packet,
@@ -117,6 +118,39 @@ def test_upstox_ltpc_message_updates_aggregator(tmp_path) -> None:
     assert monitor.last_prices["NSE_EQ|INE002A01018"] == Decimal("1400.25")
 
 
+def test_upstox_recovery_uses_intraday_v3(monkeypatch) -> None:
+    called = {}
+
+    class Result:
+        class data:
+            candles = [
+                ["2026-09-15T09:39:00+05:30", 372, 372.5, 369, 369.2, 100, 0]
+            ]
+
+    class History:
+        def __init__(self, client):
+            called["client"] = client
+
+        def get_intra_day_candle_data(self, token, unit, interval):
+            called["args"] = (token, unit, interval)
+            return Result()
+
+    class FakeSdk:
+        HistoryV3Api = History
+
+    gateway = UpstoxGateway("key", "secret", "http://localhost/callback")
+    gateway.api_client = object()
+    monkeypatch.setattr(upstox_service, "_upstox_module", lambda: FakeSdk)
+    candles = gateway.completed_candles(
+        "NSE_EQ|INE002A01018",
+        datetime(2026, 9, 15, 9, 40, tzinfo=IST),
+        datetime(2026, 9, 15, 9, 42, 3, tzinfo=IST),
+    )
+    assert called["args"] == ("NSE_EQ|INE002A01018", "minutes", "3")
+    assert len(candles) == 1
+    assert candles[0].crossed_down(Decimal("370.422360"))
+
+
 def test_dhan_token_round_trip_and_instrument_normalisation() -> None:
     token = encode_instrument("NSE_EQ", "1333")
     assert token == "NSE_EQ|1333"
@@ -176,6 +210,40 @@ def test_dhan_history_uses_final_aligned_three_minute_close() -> None:
         date(2026, 9, 15),
     )
     assert result == (date(2026, 9, 14), Decimal("365.2"))
+
+
+def test_dhan_recovery_builds_directional_three_minute_candle() -> None:
+    def epoch(minute: int) -> int:
+        value = datetime(2026, 9, 15, 9, minute, tzinfo=IST)
+        return int(value.astimezone(UTC).timestamp())
+
+    result = completed_candles_from_intraday(
+        {
+            "timestamp": [epoch(39), epoch(40), epoch(41)],
+            "open": [372, 371, 370],
+            "high": [372.5, 371.5, 370.5],
+            "low": [371, 370, 369],
+            "close": [371, 370, 369.2],
+        },
+        "NSE_EQ|1333",
+        datetime(2026, 9, 15, 9, 38, tzinfo=IST),
+        datetime(2026, 9, 15, 9, 42, tzinfo=IST),
+    )
+    assert len(result) == 1
+    assert result[0].open == Decimal("372")
+    assert result[0].close == Decimal("369.2")
+    assert result[0].crossed_down(Decimal("370.422360"))
+
+
+def test_monitor_candle_failure_is_contained(tmp_path) -> None:
+    monitor = LiveMonitor(
+        api_key="key",
+        store=Store(tmp_path / "errors.db"),
+        finalization_delay_seconds=3,
+    )
+    monitor._process([object()])  # type: ignore[list-item]
+    assert monitor.error_count == 1
+    assert "processing failed" in (monitor.last_error or "")
 
 
 def test_dhan_binary_message_updates_aggregator(tmp_path) -> None:

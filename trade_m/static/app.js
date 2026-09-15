@@ -3,6 +3,8 @@ const state = {
   events: [],
   niftySymbols: [],
   providers: {},
+  providerErrors: {},
+  feedIssues: {},
   lastEventId: Number(localStorage.getItem("tradeM.lastEventId") || 0),
   eventsLoaded: false,
 };
@@ -48,7 +50,10 @@ function renderProviderStatus(name, status) {
     button.textContent = "Configuration required";
     button.classList.add("disabled");
   } else if (status.authenticated) {
-    const feed = status.monitor.connected ? "Live feed connected." : "Signed in; feed connecting.";
+    let feed = "Signed in; feed connecting.";
+    if (status.monitor.recovering) feed = "Live feed connected; recovering missed candles.";
+    else if (status.monitor.stale) feed = "Feed connected but no recent ticks were received.";
+    else if (status.monitor.connected) feed = "Live feed connected.";
     copy.textContent = `${feed}${status.user_name ? ` Account: ${status.user_name}.` : ""}`;
     button.textContent = `Reconnect ${title}`;
     button.classList.remove("disabled");
@@ -66,7 +71,7 @@ function renderStatus(status) {
   market.className = `badge ${status.market_open ? "good" : "neutral"}`;
 
   const connected = Object.entries(state.providers)
-    .filter(([, value]) => value.monitor.connected)
+    .filter(([, value]) => value.monitor.connected && !value.monitor.stale)
     .map(([name]) => providerTitle(name));
   const feed = $("#feedBadge");
   feed.textContent = connected.length ? `${connected.join(" + ")} live` : "Feeds disconnected";
@@ -75,8 +80,28 @@ function renderStatus(status) {
 
   for (const name of ["zerodha", "upstox", "dhan"]) {
     if (state.providers[name]) renderProviderStatus(name, state.providers[name]);
-    const error = state.providers[name]?.monitor?.last_error;
-    if (error) showMessage(error, "warn");
+    const provider = state.providers[name];
+    const monitor = provider?.monitor;
+    const error = monitor?.last_error;
+    if (error && state.providerErrors[name] !== error) {
+      state.providerErrors[name] = error;
+      showMessage(error, "warn");
+    }
+
+    if (!status.market_open || !provider?.authenticated || !monitor?.running) {
+      delete state.feedIssues[name];
+      continue;
+    }
+    const issue = monitor.stale
+      ? `${providerTitle(name)} feed is stale; no recent market ticks were received.`
+      : (!monitor.connected ? `${providerTitle(name)} live feed is disconnected.` : null);
+    if (issue && state.feedIssues[name] !== issue) {
+      state.feedIssues[name] = issue;
+      showMessage(issue, "error");
+      notifySystem(`${providerTitle(name)} feed problem`, issue, `trade-m-feed-${name}`);
+    } else if (!issue) {
+      delete state.feedIssues[name];
+    }
   }
 }
 
@@ -124,17 +149,18 @@ function eventTitle(event) {
 }
 
 function eventBody(event) {
-  return `₹${event.threshold_display} was inside the ${formatTime(event.candle_start)}–${formatTime(event.candle_end)} candle (low ₹${event.candle_low}, high ₹${event.candle_high}).`;
+  const movement = event.direction === "UPPER" ? "retraced downward through" : "rebounded upward through";
+  return `Price ${movement} ₹${event.threshold_display} in the completed ${formatTime(event.candle_start)}–${formatTime(event.candle_end)} candle.`;
+}
+
+function notifySystem(title, body, tag) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const notification = new Notification(title, { body, tag, requireInteraction: true });
+  notification.onclick = () => window.focus();
 }
 
 function notify(event) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
-  const notification = new Notification(eventTitle(event), {
-    body: eventBody(event),
-    tag: `trade-m-${event.id}`,
-    requireInteraction: true,
-  });
-  notification.onclick = () => window.focus();
+  notifySystem(eventTitle(event), eventBody(event), `trade-m-${event.id}`);
 }
 
 function renderEvents() {
@@ -370,5 +396,9 @@ if ("Notification" in window && Notification.permission === "granted") {
   $("#notificationCopy").textContent = "Desktop alerts are enabled. Keep this page open during market hours.";
 }
 
-refresh();
-setInterval(refresh, 2500);
+async function refreshLoop() {
+  await refresh();
+  window.setTimeout(refreshLoop, 1000);
+}
+
+refreshLoop();

@@ -13,13 +13,14 @@ upper = B × (1 + P / 100)
 lower = B × (1 - P / 100)
 ```
 
-A completed candle triggers a level only when the level is inside that candle's full range:
+A completed candle triggers only on a directional retracement through the level:
 
 ```text
-candle.low <= level <= candle.high
+upper level: a tick-to-tick move crosses it downward
+lower level: a tick-to-tick move crosses it upward
 ```
 
-This is deliberate gap behavior. If the previous close is ₹365.20 and today's percentage is 1.43%, the upper level is ₹370.42236 (displayed as ₹370.42). Opening at ₹377 does not alert while candles remain entirely above ₹370.42. If the 09:39–09:42 candle later falls through ₹370.42 and reaches about ₹369, the first alert is generated after that candle finalizes, at approximately 09:42 IST.
+This is deliberate gap and direction behavior. If the previous close is ₹365.20 and today's percentage is 1.43%, the upper level is ₹370.42236 (displayed as ₹370.42). Opening at ₹377 does not alert. A later upward move through ₹370.42 also does not alert. If the 09:39–09:42 candle retraces downward through ₹370.42 and reaches about ₹369, the first alert is generated after that candle finalizes, at approximately 09:42 IST.
 
 The default is one upper alert and one lower alert per instrument per trading session.
 
@@ -27,6 +28,8 @@ The default is one upper alert and one lower alert per instrument per trading se
 
 - Zerodha, Upstox, and DhanHQ authentication flows
 - KiteTicker, Upstox V3, and DhanHQ WebSocket live data with automatic reconnect
+- Completed-candle recovery from broker history after a feed disconnect
+- Stale-feed detection with visible and desktop warnings during market hours
 - NSE/BSE cash-equity symbol search
 - Exchange-aligned three-minute OHLC aggregation from live ticks
 - Exact `Decimal` threshold calculations
@@ -116,6 +119,9 @@ The API documentation is available locally at <http://127.0.0.1:8000/api/docs> w
 - No synthetic candle is created if an instrument has no ticks during a three-minute interval.
 - The live access token is kept in process memory and is not written to disk.
 - Rules and events are stored in `data/trade_m.db` on the local computer.
+- Runtime diagnostics are written to the rotating `logs/trade_m.log` file as well as the terminal.
+- After a WebSocket interruption, the app requests completed candles covering the outage. Recovery is conservative because historical OHLC data cannot reconstruct the exact order of every intrabar tick.
+- The dashboard marks a connected feed stale when active rules exist during market hours but no tick has arrived for 45 seconds.
 - Changing today's percentage replaces today's rule for that symbol and clears that rule's directional alert state. Existing alert history remains available.
 - Historical reference lookup covers the preceding 14 calendar days and selects the latest completed three-minute candle before the current trading date, handling normal weekends and exchange holidays without weekday assumptions. Dhan only exposes selected minute intervals, so the app aggregates its one-minute history into exchange-aligned three-minute groups.
 - The Nifty 50 list is retrieved from the official NSE Indices constituent CSV and cached for 12 hours. A labelled packaged fallback is used if that source is temporarily unavailable.

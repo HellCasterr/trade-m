@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import struct
 import threading
 import time as time_module
@@ -13,9 +14,21 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .domain import Candle, CandleAggregator, IST, as_decimal, bucket_start, ensure_ist
+from .domain import (
+    Candle,
+    CandleAggregator,
+    IST,
+    THREE_MINUTES,
+    as_decimal,
+    bucket_start,
+    ensure_ist,
+    market_session_open,
+)
 from .kite_service import KiteUnavailable
 from .storage import Store
+
+
+logger = logging.getLogger(__name__)
 
 
 INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -76,6 +89,55 @@ def previous_close_from_intraday(
     (reference_date, _), candles = max(groups.items(), key=lambda item: item[0])
     _, final_close = max(candles, key=lambda item: item[0])
     return reference_date, final_close
+
+
+def completed_candles_from_intraday(
+    payload: dict[str, Any], instrument_token: str, since: datetime, until: datetime
+) -> list[Candle]:
+    """Aggregate Dhan one-minute history into completed three-minute candles."""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    columns = {
+        name: data.get(name) or [] for name in ("timestamp", "open", "high", "low", "close")
+    }
+    groups: dict[datetime, list[tuple[datetime, Decimal, Decimal, Decimal, Decimal]]] = {}
+    for values in zip(
+        columns["timestamp"],
+        columns["open"],
+        columns["high"],
+        columns["low"],
+        columns["close"],
+    ):
+        raw_timestamp, raw_open, raw_high, raw_low, raw_close = values
+        timestamp = ensure_ist(datetime.fromtimestamp(int(raw_timestamp), tz=UTC))
+        start = bucket_start(timestamp)
+        if start is None:
+            continue
+        end = start + THREE_MINUTES
+        if end <= until and end > since:
+            groups.setdefault(start, []).append(
+                (
+                    timestamp,
+                    as_decimal(raw_open),
+                    as_decimal(raw_high),
+                    as_decimal(raw_low),
+                    as_decimal(raw_close),
+                )
+            )
+    result: list[Candle] = []
+    for start, rows in sorted(groups.items()):
+        rows.sort(key=lambda row: row[0])
+        result.append(
+            Candle.from_ohlc(
+                instrument_token=instrument_token,
+                start=start,
+                end=start + THREE_MINUTES,
+                open=rows[0][1],
+                high=max(row[2] for row in rows),
+                low=min(row[3] for row in rows),
+                close=rows[-1][4],
+            )
+        )
+    return result
 
 
 class DhanGateway:
@@ -306,6 +368,44 @@ class DhanGateway:
         )
         return previous_close_from_intraday(self._request_json(request), trading_date)
 
+    def completed_candles(
+        self, instrument_token: str, since: datetime, until: datetime
+    ) -> list[Candle]:
+        segment, security_id = decode_instrument(instrument_token)
+        since = ensure_ist(since)
+        until = ensure_ist(until)
+        query_since = bucket_start(since) or since
+        with self._lock:
+            wait = 0.22 - (time_module.monotonic() - self._last_historical_request)
+            if wait > 0:
+                time_module.sleep(wait)
+            self._last_historical_request = time_module.monotonic()
+        body = json.dumps(
+            {
+                "securityId": security_id,
+                "exchangeSegment": segment,
+                "instrument": "EQUITY",
+                "interval": "1",
+                "oi": False,
+                "fromDate": query_since.strftime("%Y-%m-%d %H:%M:%S"),
+                "toDate": until.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        ).encode()
+        request = Request(
+            f"{API_URL}/charts/intraday",
+            data=body,
+            method="POST",
+            headers={
+                "access-token": self.require_access_token(),
+                "client-id": self.client_id,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        return completed_candles_from_intraday(
+            self._request_json(request), instrument_token, since, until
+        )
+
 
 class DhanMonitor:
     provider = "dhan"
@@ -328,10 +428,15 @@ class DhanMonitor:
         self.running = False
         self.last_error: str | None = None
         self.last_tick_at: datetime | None = None
+        self.connected_at: datetime | None = None
+        self.disconnected_at: datetime | None = None
+        self.processed_candles = 0
+        self.error_count = 0
         self.last_prices: dict[int | str, Decimal] = {}
         self._lock = threading.RLock()
         self._socket_thread: threading.Thread | None = None
         self._finalizer_thread: threading.Thread | None = None
+        self._recovery_thread: threading.Thread | None = None
         self._generation = 0
 
     @staticmethod
@@ -362,6 +467,9 @@ class DhanMonitor:
         with self._lock:
             self.running = True
             self.last_error = None
+            self.aggregator = CandleAggregator()
+            self.last_tick_at = None
+            self.connected_at = None
             self._generation += 1
             generation = self._generation
             self._socket_thread = threading.Thread(
@@ -418,7 +526,10 @@ class DhanMonitor:
                 if not self.running or self._generation != generation:
                     return
                 self.socket = app
-            app.run_forever(ping_interval=20, ping_timeout=10)
+            try:
+                app.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as exc:
+                self._record_error(f"Dhan WebSocket loop recovered from: {exc}")
             if self.running and self._generation == generation:
                 time_module.sleep(5)
 
@@ -429,15 +540,34 @@ class DhanMonitor:
             connected = self.connected
         if socket is not None and connected:
             for message in messages:
-                socket.send(json.dumps(message))
+                try:
+                    socket.send(json.dumps(message))
+                except Exception as exc:
+                    self._record_error(f"Dhan subscription failed: {exc}")
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            now = datetime.now(IST)
+            anchor = self.last_tick_at or self.connected_at
+            age = (now - anchor).total_seconds() if anchor else None
+            has_rules = bool(self.store.active_rules(now.date(), provider=self.provider))
+            stale = bool(
+                self.running
+                and self.connected
+                and has_rules
+                and market_session_open(now)
+                and (age is None or age > 45)
+            )
             return {
                 "running": self.running,
                 "connected": self.connected,
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+                "last_tick_age_seconds": round(age, 1) if age is not None else None,
+                "stale": stale,
+                "recovering": bool(self._recovery_thread and self._recovery_thread.is_alive()),
+                "processed_candles": self.processed_candles,
+                "error_count": self.error_count,
                 "last_prices": {str(key): str(value) for key, value in self.last_prices.items()},
             }
 
@@ -446,7 +576,10 @@ class DhanMonitor:
             if not self.running or socket is not self.socket:
                 return
             self.connected = True
+            self.connected_at = datetime.now(IST)
             self.last_error = None
+            recovery_from = self.disconnected_at
+            generation = self._generation
         tokens = [
             rule["instrument_token"]
             for rule in self.store.active_rules(
@@ -454,6 +587,8 @@ class DhanMonitor:
             )
         ]
         self.subscribe(tokens)
+        if recovery_from and tokens:
+            self._start_recovery(tokens, recovery_from, generation)
 
     def _on_message(self, _socket: Any, message: bytes | str) -> None:
         with self._lock:
@@ -476,28 +611,110 @@ class DhanMonitor:
 
     def _finalizer_loop(self, generation: int) -> None:
         while self.running and self._generation == generation:
-            with self._lock:
-                completed = self.aggregator.finalize_due(
-                    datetime.now(IST), self.finalization_delay_seconds
-                )
-            self._process(completed)
+            try:
+                with self._lock:
+                    completed = self.aggregator.finalize_due(
+                        datetime.now(IST), self.finalization_delay_seconds
+                    )
+                self._process(completed)
+            except Exception as exc:
+                self._record_error(f"Dhan candle finalizer recovered from: {exc}")
             time_module.sleep(0.5)
 
     def _process(self, candles: list[Candle]) -> None:
         for candle in candles:
-            for event in self.store.evaluate_candle(candle, provider=self.provider):
-                self.on_event(event)
+            try:
+                events = self.store.evaluate_candle(candle, provider=self.provider)
+                with self._lock:
+                    self.processed_candles += 1
+                for event in events:
+                    try:
+                        self.on_event(event)
+                    except Exception as exc:
+                        self._record_error(f"Dhan event callback failed: {exc}")
+            except Exception as exc:
+                self._record_error(f"Dhan candle processing failed: {exc}")
+
+    def _start_recovery(
+        self, tokens: list[int | str], since: datetime, generation: int
+    ) -> None:
+        with self._lock:
+            if self._recovery_thread and self._recovery_thread.is_alive():
+                return
+            self._recovery_thread = threading.Thread(
+                target=self._recover,
+                args=(sorted(set(str(token) for token in tokens)), since, generation),
+                name="trade-m-dhan-recovery",
+                daemon=True,
+            )
+            self._recovery_thread.start()
+
+    def _recover(self, tokens: list[str], since: datetime, generation: int) -> None:
+        failures: list[str] = []
+        first_until = datetime.now(IST)
+        failures.extend(self._recover_pass(tokens, since, first_until, generation))
+        current_start = bucket_start(first_until)
+        if current_start is not None and since < current_start + THREE_MINUTES:
+            due = current_start + THREE_MINUTES + timedelta(
+                seconds=self.finalization_delay_seconds
+            )
+            while self.running and self._generation == generation:
+                remaining = (due - datetime.now(IST)).total_seconds()
+                if remaining <= 0:
+                    break
+                time_module.sleep(min(0.5, remaining))
+            if self.running and self._generation == generation:
+                failures.extend(
+                    self._recover_pass(
+                        tokens, since, datetime.now(IST), generation
+                    )
+                )
+        with self._lock:
+            if self._generation != generation:
+                return
+            if failures:
+                self.error_count += len(failures)
+                self.last_error = (
+                    f"Dhan recovery failed for {len(failures)} instrument(s): "
+                    f"{failures[0]}"
+                )
+            else:
+                self.disconnected_at = None
+
+    def _recover_pass(
+        self,
+        tokens: list[str],
+        since: datetime,
+        until: datetime,
+        generation: int,
+    ) -> list[str]:
+        failures: list[str] = []
+        for token in tokens:
+            if not self.running or self._generation != generation:
+                break
+            try:
+                self._process(self.gateway.completed_candles(token, since, until))
+            except Exception as exc:
+                failures.append(f"{token}: {exc}")
+        return failures
+
+    def _record_error(self, message: str) -> None:
+        with self._lock:
+            self.error_count += 1
+            self.last_error = message
+        logger.warning(message)
 
     def _on_error(self, _socket: Any, error: Any) -> None:
         with self._lock:
             if _socket is not self.socket:
                 return
-            self.last_error = f"Dhan WebSocket error: {error}"
+        self._record_error(f"Dhan WebSocket error: {error}")
 
     def _on_close(self, _socket: Any, code: int | None, reason: str | None) -> None:
         with self._lock:
             if _socket is not self.socket:
                 return
             self.connected = False
+            self.disconnected_at = self.disconnected_at or datetime.now(IST)
             if self.running:
                 self.last_error = f"Dhan WebSocket closed ({code}): {reason or 'no reason'}"

@@ -79,6 +79,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     monitors: dict[str, Any] = {
         "zerodha": LiveMonitor(
             api_key=settings.api_key,
+            gateway=kite_gateway,
             store=store,
             finalization_delay_seconds=settings.candle_finalization_delay_seconds,
         ),
@@ -119,7 +120,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.3.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.4.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store
