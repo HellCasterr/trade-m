@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trade M · Three-minute alerts</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">INDIAN MARKET MONITOR</p>
+        <h1>Trade M</h1>
+        <p class="lede">Live, completed three-minute candle alerts—without placing trades.</p>
+      </div>
+      <div class="status-stack">
+        <span id="marketBadge" class="badge neutral">Checking market…</span>
+        <span id="feedBadge" class="badge neutral">Feed disconnected</span>
+      </div>
+    </header>
+
+    <section id="message" class="message hidden" role="status"></section>
+
+    <section class="grid top-grid">
+      <article class="card login-card">
+        <p class="kicker">1 · CONNECT</p>
+        <h2>Zerodha session</h2>
+        <p id="loginCopy">Sign in before searching instruments or starting the live feed.</p>
+        <a id="loginButton" class="button primary" href="/auth/login">Sign in with Zerodha</a>
+      </article>
+
+      <article class="card notification-card">
+        <p class="kicker">2 · ENABLE</p>
+        <h2>Browser notifications</h2>
+        <p id="notificationCopy">Allow desktop alerts in this browser and keep this page open.</p>
+        <button id="notificationButton" class="button secondary">Enable notifications</button>
+      </article>
+    </section>
+
+    <section class="card rule-card">
+      <div class="section-heading">
+        <div>
+          <p class="kicker">3 · MONITOR</p>
+          <h2>Add today’s rule</h2>
+        </div>
+        <p class="hint">The percentage is entered fresh for each trading day.</p>
+      </div>
+      <form id="ruleForm" class="rule-form">
+        <label>
+          Exchange
+          <select id="exchange" name="exchange">
+            <option value="NSE">NSE</option>
+            <option value="BSE">BSE</option>
+          </select>
+        </label>
+        <label class="symbol-field">
+          Exact trading symbol
+          <input id="symbol" name="tradingsymbol" autocomplete="off" placeholder="Example: TATAMOTORS" required>
+          <div id="suggestions" class="suggestions hidden"></div>
+        </label>
+        <label>
+          Move percentage
+          <div class="percent-wrap">
+            <input id="percentage" name="percentage" type="number" min="0.01" max="50" step="0.01" placeholder="1.43" required>
+            <span>%</span>
+          </div>
+        </label>
+        <button class="button primary add-button" type="submit">Calculate & monitor</button>
+      </form>
+    </section>
+
+    <section class="section-block">
+      <div class="section-heading">
+        <div>
+          <p class="kicker">TODAY</p>
+          <h2>Active levels</h2>
+        </div>
+        <p id="serverTime" class="hint"></p>
+      </div>
+      <div id="rules" class="rules-list empty-state">No active rules yet.</div>
+    </section>
+
+    <section class="section-block">
+      <div class="section-heading">
+        <div>
+          <p class="kicker">ALERT LOG</p>
+          <h2>Crossings</h2>
+        </div>
+        <p class="hint">A level must be inside the completed candle’s low–high range.</p>
+      </div>
+      <div id="events" class="events-list empty-state">No alerts triggered today.</div>
+    </section>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
