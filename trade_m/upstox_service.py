@@ -6,9 +6,9 @@ import time as time_module
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+import requests
 
 from .domain import Candle, CandleAggregator, IST, as_decimal, ensure_ist
 from .kite_service import KiteUnavailable
@@ -49,32 +49,35 @@ class UpstoxGateway:
         return f"https://api.upstox.com/v2/login/authorization/dialog?{query}"
 
     def authenticate(self, code: str) -> dict[str, Any]:
-        body = urlencode(
-            {
-                "code": code,
-                "client_id": self.api_key,
-                "client_secret": self.api_secret,
-                "redirect_uri": self.redirect_url,
-                "grant_type": "authorization_code",
-            }
-        ).encode()
-        request = Request(
-            "https://api.upstox.com/v2/login/authorization/token",
-            data=body,
-            method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
         try:
-            with urlopen(request, timeout=20) as response:
-                session = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise KiteUnavailable(f"Upstox token exchange failed ({exc.code}): {detail}") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            response = requests.post(
+                "https://api.upstox.com/v2/login/authorization/token",
+                data={
+                    "code": code,
+                    "client_id": self.api_key,
+                    "client_secret": self.api_secret,
+                    "redirect_uri": self.redirect_url,
+                    "grant_type": "authorization_code",
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
             raise KiteUnavailable(f"Upstox token exchange failed: {exc}") from exc
+        try:
+            session = response.json()
+        except requests.JSONDecodeError as exc:
+            raise KiteUnavailable(
+                f"Upstox token exchange failed ({response.status_code}): "
+                f"{response.text[:500]}"
+            ) from exc
+        if not response.ok:
+            raise KiteUnavailable(
+                f"Upstox token exchange failed ({response.status_code}): {session}"
+            )
 
         access_token = session.get("access_token")
         if not access_token:

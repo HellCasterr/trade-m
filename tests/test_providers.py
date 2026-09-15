@@ -14,6 +14,7 @@ from trade_m.domain import IST
 from trade_m.kite_service import LiveMonitor
 from trade_m.storage import Store
 from trade_m.upstox_service import UpstoxGateway, UpstoxMonitor
+import trade_m.upstox_service as upstox_service
 
 
 class FakeKiteTicker:
@@ -54,6 +55,43 @@ def test_upstox_instrument_record_is_normalised() -> None:
     )
     assert result["tradingsymbol"] == "RELIANCE"
     assert result["instrument_token"] == "NSE_EQ|INE002A01018"
+
+
+def test_upstox_token_exchange_uses_requests(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"access_token": "access", "user_name": "Test user"}
+
+    class FakeConfiguration:
+        access_token = None
+
+    class FakeSdk:
+        Configuration = FakeConfiguration
+
+        @staticmethod
+        def ApiClient(configuration):
+            return configuration
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(upstox_service.requests, "post", fake_post)
+    monkeypatch.setattr(upstox_service, "_upstox_module", lambda: FakeSdk)
+    gateway = UpstoxGateway("api-key", "api-secret", "http://localhost/callback")
+    gateway.authenticate("single-use-code")
+
+    assert captured["data"]["grant_type"] == "authorization_code"
+    assert captured["data"]["redirect_uri"] == "http://localhost/callback"
+    assert gateway.authenticated
 
 
 def test_upstox_ltpc_message_updates_aggregator(tmp_path) -> None:
