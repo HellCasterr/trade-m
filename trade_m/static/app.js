@@ -19,8 +19,10 @@ function showMessage(text, kind = "info") {
 }
 
 async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers,
     ...options,
   });
   if (!response.ok) {
@@ -345,6 +347,58 @@ $("#addNiftyButton").addEventListener("click", async () => {
   finally {
     button.disabled = false;
     button.textContent = "Add all 50";
+  }
+});
+
+$("#excelImportForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const provider = $("#excelProvider").value;
+  const file = $("#excelWorkbook").files[0];
+  if (!state.providers[provider]?.authenticated) {
+    showMessage(`Sign in to ${providerTitle(provider)} first.`, "error");
+    return;
+  }
+  if (!file) {
+    showMessage("Choose an .xlsx workbook first.", "error");
+    return;
+  }
+  const button = $("#excelImportButton");
+  const resultBox = $("#excelImportResult");
+  const form = new FormData();
+  form.append("provider", provider);
+  form.append("workbook", file);
+  button.disabled = true;
+  button.textContent = "Validating & calculating…";
+  resultBox.className = "import-result hidden";
+  try {
+    const result = await api("/api/rules/import", { method: "POST", body: form });
+    const summary = `${result.created} stock${result.created === 1 ? "" : "s"} added, ${result.failed} failed, ${result.skipped} skipped.`;
+    resultBox.replaceChildren();
+    const heading = document.createElement("strong");
+    heading.textContent = summary;
+    resultBox.append(heading);
+    if (result.failures.length) {
+      const list = document.createElement("ul");
+      for (const item of result.failures.slice(0, 8)) {
+        const row = document.createElement("li");
+        row.textContent = `Row ${item.row}: ${item.exchange}:${item.symbol} — ${item.error}`;
+        list.append(row);
+      }
+      resultBox.append(list);
+    }
+    resultBox.className = `import-result ${result.failed ? "warn" : "success"}`;
+    showMessage(summary, result.failed ? "warn" : "success");
+    if (result.created) {
+      $("#excelWorkbook").value = "";
+      await refresh();
+    }
+  } catch (error) {
+    resultBox.textContent = error.message;
+    resultBox.className = "import-result warn";
+    showMessage(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Upload & monitor";
   }
 });
 

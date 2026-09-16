@@ -39,6 +39,7 @@ The default is one upper alert and one lower alert per instrument per trading se
 - A new percentage can be entered for each stock every trading day
 - Bulk addition of the official Nifty 50 constituent list
 - One common Nifty percentage with editable per-stock overrides
+- Custom Excel upload for monitoring a user-defined stock list
 - Editable daily percentage table and individual/bulk start-pause controls
 - Provider-specific WebSocket batching (Zerodha/Upstox 500, DhanHQ 100) and throttled historical requests
 - Windows setup and start scripts
@@ -97,6 +98,7 @@ Zerodha documents the login flow at <https://kite.trade/docs/connect/v3/user/>, 
 7. In the opened dashboard, sign in to any configured provider(s).
 8. Select **Enable notifications** and approve the browser prompt.
 9. Search for an exact symbol and add a rule, or use **Load Nifty 50**, apply a common percentage, optionally edit individual percentages, then select **Add all 50**.
+   To monitor a custom list, select **Download sample Excel**, fill the workbook, choose a connected provider under **Upload stocks from Excel**, and select **Upload & monitor**.
 10. Keep the terminal and browser page open during market hours.
 
 Broker sessions expire, so signing in is part of the daily start-up flow. Secrets in `.env` and the local SQLite database are excluded from Git.
@@ -111,6 +113,19 @@ py -3 -m venv .venv
 ```
 
 The API documentation is available locally at <http://127.0.0.1:8000/api/docs> while the app is running.
+
+## Excel stock-list import
+
+The downloadable workbook contains these columns:
+
+| Column | Required | Accepted values |
+| --- | --- | --- |
+| Trading Symbol | Yes | Exact broker symbol, such as `RELIANCE`, `TCS`, or `M&M` |
+| Percentage | Yes | A value greater than 0 and at most 50, such as `1.43` |
+| Exchange | No | `NSE` or `BSE`; blank defaults to `NSE` |
+| Enabled | No | `TRUE` or `FALSE`; blank defaults to `TRUE` |
+
+The app accepts `.xlsx` files up to 2 MB and at most 200 populated stock rows. It validates the complete sheet before contacting the broker. Duplicate symbols, missing percentages, unsupported exchanges, and invalid percentages stop the import and identify their row numbers. After validation, broker-specific symbol or historical-data failures are reported per stock while successfully created rules begin monitoring.
 
 ## Operational notes
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .config import Settings, get_settings
 from .dhan_service import DhanGateway, DhanMonitor
 from .domain import IST, SESSION_CLOSE, SESSION_OPEN
+from .excel_import import StockWorkbookError, parse_stock_workbook
 from .kite_service import KiteGateway, KiteUnavailable, LiveMonitor, create_daily_rule
 from .nifty50 import Nifty50Service
 from .storage import Store
@@ -42,6 +43,9 @@ class NiftyBulkInput(BaseModel):
 class BulkStatusInput(BaseModel):
     active: bool
     rule_ids: list[int] | None = None
+
+
+MAX_WORKBOOK_BYTES = 2 * 1024 * 1024
 
 
 def _percentage(value: Decimal) -> Decimal:
@@ -120,7 +124,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.4.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.5.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store
@@ -337,6 +341,65 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             "failed": len(failures),
             "failures": failures,
             "source": constituent_result.source,
+            "rules": created,
+        }
+
+    @app.post("/api/rules/import", status_code=201)
+    def import_rules(
+        provider: str = Form(...), workbook: UploadFile = File(...)
+    ) -> dict[str, Any]:
+        gateway, monitor = provider_objects(provider)
+        if not gateway.authenticated:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Sign in to {provider.title()} before importing stocks.",
+            )
+        filename = workbook.filename or ""
+        if not filename.lower().endswith(".xlsx"):
+            raise HTTPException(status_code=400, detail="Upload an .xlsx Excel workbook.")
+        content = workbook.file.read(MAX_WORKBOOK_BYTES + 1)
+        if len(content) > MAX_WORKBOOK_BYTES:
+            raise HTTPException(
+                status_code=413, detail="The Excel workbook must be 2 MB or smaller."
+            )
+        try:
+            parsed = parse_stock_workbook(content)
+        except StockWorkbookError as exc:
+            detail = " ".join(exc.errors[:12])
+            if len(exc.errors) > 12:
+                detail += f" {len(exc.errors) - 12} more row errors were found."
+            raise HTTPException(status_code=400, detail=detail) from exc
+
+        created: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        today = datetime.now(IST).date()
+        for item in parsed.stocks:
+            try:
+                created.append(
+                    create_daily_rule(
+                        gateway,
+                        store,
+                        exchange=item.exchange,
+                        tradingsymbol=item.tradingsymbol,
+                        percentage=item.percentage,
+                        trading_date=today,
+                    )
+                )
+            except Exception as exc:
+                failures.append(
+                    {
+                        "row": item.row_number,
+                        "exchange": item.exchange,
+                        "symbol": item.tradingsymbol,
+                        "error": str(exc),
+                    }
+                )
+        monitor.subscribe([rule["instrument_token"] for rule in created])
+        return {
+            "created": len(created),
+            "failed": len(failures),
+            "skipped": parsed.skipped,
+            "failures": failures,
             "rules": created,
         }
 

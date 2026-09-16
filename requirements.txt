@@ -6,3 +6,5 @@ websocket-client>=1.8,<2
 requests>=2.32,<3
 python-dotenv>=1.0,<2
 tzdata>=2025.1
+openpyxl>=3.1,<4
+python-multipart>=0.0.20,<1

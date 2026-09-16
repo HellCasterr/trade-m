@@ -128,6 +128,37 @@
       </div>
     </section>
 
+    <section class="card import-card">
+      <div class="section-heading">
+        <div>
+          <p class="kicker">CUSTOM LIST BULK SETUP</p>
+          <h2>Upload stocks from Excel</h2>
+        </div>
+        <a class="template-link" href="/static/trade_m_stock_import_template.xlsx" download>
+          Download sample Excel
+        </a>
+      </div>
+      <form id="excelImportForm" class="import-toolbar">
+        <label>
+          Provider
+          <select id="excelProvider" name="provider">
+            <option value="zerodha">Zerodha</option>
+            <option value="upstox">Upstox</option>
+            <option value="dhan">DhanHQ</option>
+          </select>
+        </label>
+        <label class="file-field">
+          Excel workbook
+          <input id="excelWorkbook" name="workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+        </label>
+        <button id="excelImportButton" class="button primary" type="submit">Upload & monitor</button>
+      </form>
+      <p class="hint import-help">
+        Use exact broker trading symbols. Required columns: Trading Symbol and Percentage. Exchange and Enabled are optional.
+      </p>
+      <div id="excelImportResult" class="import-result hidden" aria-live="polite"></div>
+    </section>
+
     <section class="section-block">
       <div class="section-heading">
         <div>
@@ -149,7 +180,7 @@
           <p class="kicker">ALERT LOG</p>
           <h2>Crossings</h2>
         </div>
-        <p class="hint">A level must be inside the completed candle’s low–high range.</p>
+        <p class="hint">Upper alerts require a downward retracement; lower alerts require an upward rebound.</p>
       </div>
       <div id="events" class="events-list empty-state">No alerts triggered today.</div>
     </section>

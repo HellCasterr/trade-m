@@ -22,6 +22,8 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
         assert dashboard.status_code == 200
         assert "Trade M" in dashboard.text
         assert "Add all constituents" in dashboard.text
+        assert "Upload stocks from Excel" in dashboard.text
+        assert "Download sample Excel" in dashboard.text
         assert "Sign in with Upstox" in dashboard.text
         assert "Sign in with Dhan" in dashboard.text
 
@@ -35,3 +37,7 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
 
         assert client.get("/api/rules").json() == []
         assert client.get("/api/events").json() == []
+
+        template = client.get("/static/trade_m_stock_import_template.xlsx")
+        assert template.status_code == 200
+        assert template.content.startswith(b"PK")
