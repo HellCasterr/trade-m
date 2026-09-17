@@ -1,7 +1,8 @@
+import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
 
-from trade_m.domain import Candle, IST, calculate_levels
+from trade_m.domain import IST, Candle, calculate_levels
 from trade_m.storage import Store
 
 
@@ -115,6 +116,40 @@ def test_rule_update_resets_directional_state(tmp_path) -> None:
     assert rule["upper_sent"] is False
 
 
+def test_unchanged_rule_upsert_preserves_directional_state(tmp_path) -> None:
+    store = make_store(tmp_path)
+    rule_id = add_example_rule(store)
+    store.evaluate_candle(candle("372", "369"))
+    existing = store.get_rule(rule_id)
+    assert existing is not None and existing["upper_sent"] is True
+
+    same_id = store.upsert_rule(
+        exchange="NSE",
+        tradingsymbol="TATAMOTORS",
+        instrument_token=884737,
+        trading_date=date(2026, 9, 15),
+        percentage=Decimal("1.430"),
+        reference_date=date(2026, 9, 14),
+        reference_close=Decimal("365.200"),
+        upper_level=Decimal(existing["upper_level"]),
+        lower_level=Decimal(existing["lower_level"]),
+    )
+
+    assert same_id == rule_id
+    assert store.get_rule(rule_id)["upper_sent"] is True
+
+
+def test_candle_checkpoint_is_persisted_and_deduplicates_reprocessing(tmp_path) -> None:
+    store = make_store(tmp_path)
+    add_example_rule(store)
+    completed = candle("372", "369")
+
+    assert len(store.evaluate_candle(completed)) == 1
+    assert store.candle_checkpoint("zerodha", 884737, date(2026, 9, 15)) == completed.end
+    assert store.evaluate_candle(completed) == []
+    assert len(store.events_after()) == 1
+
+
 def test_provider_isolates_same_instrument_identifier(tmp_path) -> None:
     store = make_store(tmp_path)
     add_example_rule(store)
@@ -145,3 +180,35 @@ def test_percentage_edit_and_bulk_pause(tmp_path) -> None:
     assert store.set_rules_active(date(2026, 9, 15), False) == 1
     assert store.daily_rules(date(2026, 9, 15))[0]["active"] is False
     assert store.active_rules(date(2026, 9, 15)) == []
+
+
+def test_existing_event_table_is_migrated_for_stop_fields(tmp_path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            candle_start TEXT NOT NULL,
+            candle_end TEXT NOT NULL,
+            candle_open TEXT NOT NULL,
+            candle_high TEXT NOT NULL,
+            candle_low TEXT NOT NULL,
+            candle_close TEXT NOT NULL,
+            threshold TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(rule_id, direction, candle_start)
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = Store(path)
+    with store.connection() as migrated:
+        columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(events)")
+        }
+    assert {"trade_side", "stop_loss", "stop_confidence"} <= columns

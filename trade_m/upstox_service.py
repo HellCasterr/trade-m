@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time as time_module
@@ -12,18 +11,17 @@ from urllib.parse import urlencode
 import requests
 
 from .domain import (
-    Candle,
-    CandleAggregator,
     IST,
     THREE_MINUTES,
+    Candle,
+    CandleAggregator,
     as_decimal,
-    bucket_start,
     ensure_ist,
     market_session_open,
 )
 from .kite_service import KiteUnavailable
+from .monitoring import ReliableMonitorMixin
 from .storage import Store
-
 
 logger = logging.getLogger(__name__)
 
@@ -160,29 +158,18 @@ class UpstoxGateway:
     def previous_session_close(
         self, instrument_token: str, trading_date: date
     ) -> tuple[date, Decimal]:
-        with self._lock:
-            wait = 0.15 - (time_module.monotonic() - self._last_historical_request)
-            if wait > 0:
-                time_module.sleep(wait)
-            self._last_historical_request = time_module.monotonic()
-        upstox = _upstox_module()
-        history = upstox.HistoryV3Api(self.require_client())
-        from_date = (trading_date - timedelta(days=14)).isoformat()
-        to_date = (trading_date - timedelta(days=1)).isoformat()
-        response = history.get_historical_candle_data1(
-            instrument_token, "minutes", "3", to_date, from_date
+        candles = self.historical_candles(
+            instrument_token,
+            datetime.combine(trading_date - timedelta(days=14), datetime.min.time()),
+            datetime.combine(trading_date - timedelta(days=1), datetime.max.time()),
         )
-        eligible: list[tuple[datetime, list[Any]]] = []
-        for candle in response.data.candles or []:
-            timestamp = ensure_ist(datetime.fromisoformat(str(candle[0]).replace("Z", "+00:00")))
-            if timestamp.date() < trading_date:
-                eligible.append((timestamp, candle))
+        eligible = [candle for candle in candles if candle.start.date() < trading_date]
         if not eligible:
             raise KiteUnavailable(
                 "No prior Upstox three-minute candle was returned for this instrument."
             )
-        timestamp, final_candle = max(eligible, key=lambda value: value[0])
-        return timestamp.date(), as_decimal(final_candle[4])
+        final_candle = max(eligible, key=lambda value: value.start)
+        return final_candle.start.date(), final_candle.close
 
     def india_vix_previous_close(self, trading_date: date) -> tuple[date, Decimal]:
         return self.previous_session_close(INDIA_VIX_INSTRUMENT_KEY, trading_date)
@@ -221,8 +208,49 @@ class UpstoxGateway:
                 )
         return result
 
+    def historical_candles(
+        self, instrument_token: str, since: datetime, until: datetime
+    ) -> list[Candle]:
+        """Return archived three-minute candles (Upstox permits one month/call)."""
+        since = ensure_ist(since)
+        until = ensure_ist(until)
+        with self._lock:
+            wait = 0.15 - (time_module.monotonic() - self._last_historical_request)
+            if wait > 0:
+                time_module.sleep(wait)
+            self._last_historical_request = time_module.monotonic()
+        upstox = _upstox_module()
+        response = upstox.HistoryV3Api(
+            self.require_client()
+        ).get_historical_candle_data1(
+            instrument_token,
+            "minutes",
+            "3",
+            until.date().isoformat(),
+            since.date().isoformat(),
+        )
+        result: list[Candle] = []
+        for row in response.data.candles or []:
+            start = ensure_ist(
+                datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+            )
+            end = start + THREE_MINUTES
+            if end <= until and end > since:
+                result.append(
+                    Candle.from_ohlc(
+                        instrument_token=instrument_token,
+                        start=start,
+                        end=end,
+                        open=as_decimal(row[1]),
+                        high=as_decimal(row[2]),
+                        low=as_decimal(row[3]),
+                        close=as_decimal(row[4]),
+                    )
+                )
+        return result
 
-class UpstoxMonitor:
+
+class UpstoxMonitor(ReliableMonitorMixin):
     provider = "upstox"
 
     def __init__(
@@ -250,8 +278,8 @@ class UpstoxMonitor:
         self.last_prices: dict[int | str, Decimal] = {}
         self._lock = threading.RLock()
         self._finalizer_thread: threading.Thread | None = None
-        self._recovery_thread: threading.Thread | None = None
         self._generation = 0
+        self._init_reliability()
 
     def start(self, access_token: str) -> None:
         if not access_token:
@@ -286,6 +314,7 @@ class UpstoxMonitor:
                 daemon=True,
             )
             self._finalizer_thread.start()
+            self._start_reliability_workers(generation)
         try:
             streamer.connect()
         except Exception as exc:
@@ -301,6 +330,7 @@ class UpstoxMonitor:
             streamer = self.streamer
             self.streamer = None
             self.connected = False
+            self._wake_reliability_workers()
         if streamer is not None:
             try:
                 streamer.disconnect()
@@ -308,16 +338,27 @@ class UpstoxMonitor:
                 pass
 
     def subscribe(self, tokens: list[int | str]) -> None:
-        keys = sorted(set(str(token) for token in tokens))
+        self._request_subscriptions(tokens)
+
+    def _coerce_token(self, token: int | str) -> str:
+        return str(token)
+
+    def _subscribe_batches(self, tokens: set[Any]) -> set[Any]:
+        keys = sorted(str(token) for token in tokens)
         with self._lock:
             streamer = self.streamer
             connected = self.connected
-        if streamer is not None and connected:
-            for start in range(0, len(keys), 500):
-                try:
-                    streamer.subscribe(keys[start : start + 500], "ltpc")
-                except Exception as exc:
-                    self._record_error(f"Upstox subscription failed: {exc}")
+        if streamer is None or not connected:
+            return set()
+        subscribed: set[Any] = set()
+        for start in range(0, len(keys), 500):
+            batch = keys[start : start + 500]
+            try:
+                streamer.subscribe(batch, "ltpc")
+                subscribed.update(batch)
+            except Exception as exc:
+                self._record_error(f"Upstox subscription failed: {exc}")
+        return subscribed
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -332,33 +373,26 @@ class UpstoxMonitor:
                 and market_session_open(now)
                 and (age is None or age > 45)
             )
-            return {
+            status = {
                 "running": self.running,
                 "connected": self.connected,
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
                 "last_tick_age_seconds": round(age, 1) if age is not None else None,
                 "stale": stale,
-                "recovering": bool(self._recovery_thread and self._recovery_thread.is_alive()),
                 "processed_candles": self.processed_candles,
                 "error_count": self.error_count,
                 "last_prices": {str(key): str(value) for key, value in self.last_prices.items()},
             }
+        status.update(self._reliability_status())
+        return status
 
     def _on_open(self) -> None:
         with self._lock:
             self.connected = True
             self.connected_at = datetime.now(IST)
             self.last_error = None
-            recovery_from = self.disconnected_at
-            generation = self._generation
-        keys = [
-            rule["instrument_token"]
-            for rule in self.store.active_rules(datetime.now(IST).date(), provider=self.provider)
-        ]
-        self.subscribe(keys)
-        if recovery_from and keys:
-            self._start_recovery(keys, recovery_from, generation)
+        self._connection_ready()
 
     def _on_message(self, message: dict[str, Any]) -> None:
         now = datetime.now(IST)
@@ -398,81 +432,7 @@ class UpstoxMonitor:
             time_module.sleep(0.5)
 
     def _process(self, candles: list[Candle]) -> None:
-        for candle in candles:
-            try:
-                events = self.store.evaluate_candle(candle, provider=self.provider)
-                with self._lock:
-                    self.processed_candles += 1
-                for event in events:
-                    try:
-                        self.on_event(event)
-                    except Exception as exc:
-                        self._record_error(f"Upstox event callback failed: {exc}")
-            except Exception as exc:
-                self._record_error(f"Upstox candle processing failed: {exc}")
-
-    def _start_recovery(
-        self, tokens: list[int | str], since: datetime, generation: int
-    ) -> None:
-        with self._lock:
-            if self._recovery_thread and self._recovery_thread.is_alive():
-                return
-            self._recovery_thread = threading.Thread(
-                target=self._recover,
-                args=(sorted(set(str(token) for token in tokens)), since, generation),
-                name="trade-m-upstox-recovery",
-                daemon=True,
-            )
-            self._recovery_thread.start()
-
-    def _recover(self, tokens: list[str], since: datetime, generation: int) -> None:
-        failures: list[str] = []
-        first_until = datetime.now(IST)
-        failures.extend(self._recover_pass(tokens, since, first_until, generation))
-        current_start = bucket_start(first_until)
-        if current_start is not None and since < current_start + THREE_MINUTES:
-            due = current_start + THREE_MINUTES + timedelta(
-                seconds=self.finalization_delay_seconds
-            )
-            while self.running and self._generation == generation:
-                remaining = (due - datetime.now(IST)).total_seconds()
-                if remaining <= 0:
-                    break
-                time_module.sleep(min(0.5, remaining))
-            if self.running and self._generation == generation:
-                failures.extend(
-                    self._recover_pass(
-                        tokens, since, datetime.now(IST), generation
-                    )
-                )
-        with self._lock:
-            if self._generation != generation:
-                return
-            if failures:
-                self.error_count += len(failures)
-                self.last_error = (
-                    f"Upstox recovery failed for {len(failures)} instrument(s): "
-                    f"{failures[0]}"
-                )
-            else:
-                self.disconnected_at = None
-
-    def _recover_pass(
-        self,
-        tokens: list[str],
-        since: datetime,
-        until: datetime,
-        generation: int,
-    ) -> list[str]:
-        failures: list[str] = []
-        for token in tokens:
-            if not self.running or self._generation != generation:
-                break
-            try:
-                self._process(self.gateway.completed_candles(token, since, until))
-            except Exception as exc:
-                failures.append(f"{token}: {exc}")
-        return failures
+        self._process_reliably(candles)
 
     def _record_error(self, message: str) -> None:
         with self._lock:
@@ -486,6 +446,7 @@ class UpstoxMonitor:
             self.disconnected_at = self.disconnected_at or datetime.now(IST)
             if self.running:
                 self.last_error = f"Upstox WebSocket closed ({code}): {reason}"
+        self._connection_lost()
 
     def _on_error(self, error: Any) -> None:
         self._record_error(f"Upstox WebSocket error: {error}")
@@ -498,3 +459,4 @@ class UpstoxMonitor:
         with self._lock:
             self.connected = False
             self.last_error = f"Upstox reconnect stopped: {message}"
+        self._connection_lost()

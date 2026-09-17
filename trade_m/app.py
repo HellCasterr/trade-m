@@ -128,7 +128,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.7.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.9.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store

@@ -30,6 +30,7 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
         assert "India VIX-based moving percentage" in dashboard.text
         assert "Starting live alert channel" in dashboard.text
         assert "Test alert" in dashboard.text
+        assert "indicative ATR + price-structure stop" in dashboard.text
         assert "Sign in with Upstox" in dashboard.text
         assert "Sign in with Dhan" in dashboard.text
 

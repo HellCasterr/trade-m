@@ -70,10 +70,13 @@ function renderProviderStatus(name, status) {
     button.classList.add("disabled");
   } else if (status.authenticated) {
     let feed = "Signed in; feed connecting.";
-    if (status.monitor.recovering) feed = "Live feed connected; recovering missed candles.";
+    if (status.monitor.recovering && status.monitor.connected) feed = "Live feed connected; recovering missed candles.";
     else if (status.monitor.stale) feed = "Feed connected but no recent ticks were received.";
     else if (status.monitor.connected) feed = "Live feed connected.";
-    copy.textContent = `${feed}${status.user_name ? ` Account: ${status.user_name}.` : ""}`;
+    const desired = status.monitor.desired_subscriptions || 0;
+    const subscribed = status.monitor.subscribed_instruments || 0;
+    const subscriptions = desired ? ` Monitoring ${subscribed}/${desired} stocks.` : "";
+    copy.textContent = `${feed}${subscriptions}${status.user_name ? ` Account: ${status.user_name}.` : ""}`;
     button.textContent = `Reconnect ${title}`;
     button.classList.remove("disabled");
   } else {
@@ -111,9 +114,12 @@ function renderStatus(status) {
       delete state.feedIssues[name];
       continue;
     }
-    const issue = monitor.stale
-      ? `${providerTitle(name)} feed is stale; no recent market ticks were received.`
-      : (!monitor.connected ? `${providerTitle(name)} live feed is disconnected.` : null);
+    const issue = !monitor.connected
+      ? `${providerTitle(name)} live feed is disconnected.`
+      : monitor.subscription_gap > 0
+      ? `${providerTitle(name)} is missing ${monitor.subscription_gap} live stock subscription${monitor.subscription_gap === 1 ? "" : "s"}; automatic retry is active.`
+      : monitor.stale
+      ? `${providerTitle(name)} feed is stale; no recent market ticks were received.` : null;
     if (issue && state.feedIssues[name] !== issue) {
       state.feedIssues[name] = issue;
       showMessage(issue, "error");
@@ -190,12 +196,15 @@ function renderRules() {
 }
 
 function eventTitle(event) {
-  return `${event.exchange}:${event.tradingsymbol} ${event.direction.toLowerCase()} level crossed`;
+  const setup = event.trade_side ? ` ${event.trade_side} entry alert` : ` ${event.direction.toLowerCase()} level crossed`;
+  return `${event.exchange}:${event.tradingsymbol}${setup}`;
 }
 
 function eventBody(event) {
   const movement = event.direction === "UPPER" ? "retraced downward through" : "rebounded upward through";
-  return `Price ${movement} ₹${event.threshold_display} in the completed ${formatTime(event.candle_start)}–${formatTime(event.candle_end)} candle.`;
+  const crossing = `Price ${movement} ₹${event.threshold_display} in the completed ${formatTime(event.candle_start)}–${formatTime(event.candle_end)} candle.`;
+  if (!event.stop_loss_display) return crossing;
+  return `${crossing} Reference entry ₹${event.entry_price_display}; protective stop ₹${event.stop_loss_display} (${event.risk_percent_display} risk, ${String(event.stop_confidence || "unvalidated").toLowerCase()}).`;
 }
 
 function notifySystem(title, body, tag) {
@@ -260,7 +269,11 @@ function renderEvents() {
   container.innerHTML = [...state.events].reverse().map(event => `
     <article class="event-row">
       <span class="event-dot ${event.direction.toLowerCase()}"></span>
-      <div><strong>${eventTitle(event)}</strong><p>${eventBody(event)}</p></div>
+      <div>
+        <strong>${eventTitle(event)}</strong>
+        <p>${eventBody(event)}</p>
+        ${event.stop_loss_display ? `<small class="stop-detail">${event.stop_method} · ${event.backtest_samples || 0} comparable prior alert(s). ${event.stop_explanation || ""}</small>` : ""}
+      </div>
       <time>${event.provider?.toUpperCase() || ""} · ${formatTime(event.created_at)}</time>
     </article>`).join("");
 }
@@ -446,7 +459,7 @@ $("#ruleForm").addEventListener("submit", async (event) => {
     return;
   }
   button.disabled = true;
-  button.textContent = "Calculating…";
+  button.textContent = "Loading history…";
   try {
     await api("/api/rules", {
       method: "POST",
@@ -456,6 +469,7 @@ $("#ruleForm").addEventListener("submit", async (event) => {
         tradingsymbol: $("#symbol").value,
         percentage: $("#percentage").value,
       }),
+      timeoutMs: 60000,
     });
     showMessage("Rule is active for today. Live monitoring has started.", "success");
     $("#symbol").value = "";
@@ -521,7 +535,7 @@ $("#addNiftyButton").addEventListener("click", async () => {
   }
   const button = $("#addNiftyButton");
   button.disabled = true;
-  button.textContent = "Fetching 50 reference closes…";
+  button.textContent = "Preparing 50 histories…";
   try {
     const result = await api("/api/rules/nifty50", {
       method: "POST",

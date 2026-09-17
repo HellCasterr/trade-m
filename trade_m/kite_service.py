@@ -1,25 +1,25 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time as time_module
-import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
 from .domain import (
-    Candle,
-    CandleAggregator,
     IST,
     THREE_MINUTES,
+    Candle,
+    CandleAggregator,
     as_decimal,
     bucket_start,
     calculate_levels,
     ensure_ist,
     market_session_open,
 )
+from .monitoring import ReliableMonitorMixin
 from .storage import Store
-
 
 logger = logging.getLogger(__name__)
 
@@ -124,34 +124,17 @@ class KiteGateway:
     def previous_session_close(
         self, instrument_token: int, trading_date: date
     ) -> tuple[date, Decimal]:
-        client = self.require_client()
-        with self._lock:
-            wait = 0.36 - (time_module.monotonic() - self._last_historical_request)
-            if wait > 0:
-                time_module.sleep(wait)
-            self._last_historical_request = time_module.monotonic()
         from_date = datetime.combine(trading_date - timedelta(days=14), datetime.min.time())
         to_date = datetime.combine(trading_date - timedelta(days=1), datetime.max.time())
-        candles = client.historical_data(
-            instrument_token, from_date, to_date, "3minute", continuous=False, oi=False
-        )
-        eligible: list[tuple[datetime, dict[str, Any]]] = []
-        for candle in candles:
-            raw_timestamp = candle["date"]
-            if isinstance(raw_timestamp, str):
-                timestamp = datetime.fromisoformat(raw_timestamp)
-            else:
-                timestamp = raw_timestamp
-            timestamp = ensure_ist(timestamp)
-            if timestamp.date() < trading_date:
-                eligible.append((timestamp, candle))
+        candles = self.historical_candles(instrument_token, from_date, to_date)
+        eligible = [candle for candle in candles if candle.start.date() < trading_date]
         if not eligible:
             raise KiteUnavailable(
                 "No prior three-minute candle was returned. Check the symbol and "
                 "historical-data subscription."
             )
-        timestamp, final_candle = max(eligible, key=lambda value: value[0])
-        return timestamp.date(), as_decimal(final_candle["close"])
+        final_candle = max(eligible, key=lambda value: value.start)
+        return final_candle.start.date(), final_candle.close
 
     def india_vix_previous_close(self, trading_date: date) -> tuple[date, Decimal]:
         vix = next(
@@ -171,17 +154,25 @@ class KiteGateway:
         self, instrument_token: int, since: datetime, until: datetime
     ) -> list[Candle]:
         """Return completed three-minute candles for reconnect recovery."""
-        client = self.require_client()
         since = ensure_ist(since)
         until = ensure_ist(until)
         query_since = bucket_start(since) or since
+        return self.historical_candles(instrument_token, query_since, until)
+
+    def historical_candles(
+        self, instrument_token: int, since: datetime, until: datetime
+    ) -> list[Candle]:
+        """Return archived completed three-minute candles for stop calibration."""
+        client = self.require_client()
+        since = ensure_ist(since)
+        until = ensure_ist(until)
         with self._lock:
             wait = 0.36 - (time_module.monotonic() - self._last_historical_request)
             if wait > 0:
                 time_module.sleep(wait)
             self._last_historical_request = time_module.monotonic()
         rows = client.historical_data(
-            instrument_token, query_since, until, "3minute", continuous=False, oi=False
+            instrument_token, since, until, "3minute", continuous=False, oi=False
         )
         result: list[Candle] = []
         for row in rows:
@@ -207,7 +198,7 @@ class KiteGateway:
         return result
 
 
-class LiveMonitor:
+class LiveMonitor(ReliableMonitorMixin):
     def __init__(
         self,
         *,
@@ -236,8 +227,8 @@ class LiveMonitor:
         self.last_prices: dict[int | str, Decimal] = {}
         self._lock = threading.RLock()
         self._finalizer_thread: threading.Thread | None = None
-        self._recovery_thread: threading.Thread | None = None
         self._generation = 0
+        self._init_reliability()
 
     def start(self, access_token: str) -> None:
         _, KiteTicker = _kite_classes()
@@ -275,6 +266,7 @@ class LiveMonitor:
                 daemon=True,
             )
             self._finalizer_thread.start()
+            self._start_reliability_workers(generation)
         try:
             ticker.connect(threaded=True)
         except Exception as exc:
@@ -290,6 +282,7 @@ class LiveMonitor:
             ticker = self.ticker
             self.ticker = None
             self.connected = False
+            self._wake_reliability_workers()
         if ticker is not None:
             try:
                 ticker.close()
@@ -297,18 +290,28 @@ class LiveMonitor:
                 pass
 
     def subscribe(self, tokens: list[int]) -> None:
-        unique_tokens = sorted(set(int(token) for token in tokens))
+        self._request_subscriptions(tokens)
+
+    def _coerce_token(self, token: int | str) -> int:
+        return int(token)
+
+    def _subscribe_batches(self, tokens: set[Any]) -> set[Any]:
+        unique_tokens = sorted(int(token) for token in tokens)
         with self._lock:
             ticker = self.ticker
             connected = self.connected
-        if ticker is not None and connected and unique_tokens:
-            for start in range(0, len(unique_tokens), 500):
-                batch = unique_tokens[start : start + 500]
-                try:
-                    ticker.subscribe(batch)
-                    ticker.set_mode(ticker.MODE_FULL, batch)
-                except Exception as exc:
-                    self._record_error(f"Zerodha subscription failed: {exc}")
+        if ticker is None or not connected:
+            return set()
+        subscribed: set[Any] = set()
+        for start in range(0, len(unique_tokens), 500):
+            batch = unique_tokens[start : start + 500]
+            try:
+                ticker.subscribe(batch)
+                ticker.set_mode(ticker.MODE_FULL, batch)
+                subscribed.update(batch)
+            except Exception as exc:
+                self._record_error(f"Zerodha subscription failed: {exc}")
+        return subscribed
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -323,18 +326,19 @@ class LiveMonitor:
                 and market_session_open(now)
                 and (age is None or age > 45)
             )
-            return {
+            status = {
                 "running": self.running,
                 "connected": self.connected,
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
                 "last_tick_age_seconds": round(age, 1) if age is not None else None,
                 "stale": stale,
-                "recovering": bool(self._recovery_thread and self._recovery_thread.is_alive()),
                 "processed_candles": self.processed_candles,
                 "error_count": self.error_count,
                 "last_prices": {str(key): str(value) for key, value in self.last_prices.items()},
             }
+        status.update(self._reliability_status())
+        return status
 
     def _on_connect(self, ws: Any, response: Any) -> None:
         with self._lock:
@@ -343,25 +347,7 @@ class LiveMonitor:
             self.connected = True
             self.connected_at = datetime.now(IST)
             self.last_error = None
-            recovery_from = self.disconnected_at
-            generation = self._generation
-        tokens = [
-            int(rule["instrument_token"])
-            for rule in self.store.active_rules(
-                datetime.now(IST).date(), provider=self.provider
-            )
-        ]
-        if tokens:
-            unique_tokens = sorted(set(tokens))
-            for start in range(0, len(unique_tokens), 500):
-                batch = unique_tokens[start : start + 500]
-                try:
-                    ws.subscribe(batch)
-                    ws.set_mode(ws.MODE_FULL, batch)
-                except Exception as exc:
-                    self._record_error(f"Zerodha subscription failed: {exc}")
-        if recovery_from and tokens and self.gateway is not None:
-            self._start_recovery(tokens, recovery_from, generation)
+        self._connection_ready()
 
     def _on_ticks(self, ws: Any, ticks: list[dict[str, Any]]) -> None:
         now = datetime.now(IST)
@@ -399,85 +385,7 @@ class LiveMonitor:
             time_module.sleep(0.5)
 
     def _process(self, candles: list[Candle]) -> None:
-        for candle in candles:
-            try:
-                events = self.store.evaluate_candle(candle, provider=self.provider)
-                with self._lock:
-                    self.processed_candles += 1
-                for event in events:
-                    try:
-                        self.on_event(event)
-                    except Exception as exc:
-                        self._record_error(f"Zerodha event callback failed: {exc}")
-            except Exception as exc:
-                self._record_error(f"Zerodha candle processing failed: {exc}")
-
-    def _start_recovery(
-        self, tokens: list[int], since: datetime, generation: int
-    ) -> None:
-        with self._lock:
-            if self._recovery_thread and self._recovery_thread.is_alive():
-                return
-            self._recovery_thread = threading.Thread(
-                target=self._recover,
-                args=(sorted(set(tokens)), since, generation),
-                name="trade-m-zerodha-recovery",
-                daemon=True,
-            )
-            self._recovery_thread.start()
-
-    def _recover(self, tokens: list[int], since: datetime, generation: int) -> None:
-        if self.gateway is None:
-            return
-        failures: list[str] = []
-        first_until = datetime.now(IST)
-        failures.extend(self._recover_pass(tokens, since, first_until, generation))
-        current_start = bucket_start(first_until)
-        if current_start is not None and since < current_start + THREE_MINUTES:
-            due = current_start + THREE_MINUTES + timedelta(
-                seconds=self.finalization_delay_seconds
-            )
-            while self.running and self._generation == generation:
-                remaining = (due - datetime.now(IST)).total_seconds()
-                if remaining <= 0:
-                    break
-                time_module.sleep(min(0.5, remaining))
-            if self.running and self._generation == generation:
-                failures.extend(
-                    self._recover_pass(
-                        tokens, since, datetime.now(IST), generation
-                    )
-                )
-        with self._lock:
-            if self._generation != generation:
-                return
-            if failures:
-                self.error_count += len(failures)
-                self.last_error = (
-                    f"Zerodha recovery failed for {len(failures)} instrument(s): "
-                    f"{failures[0]}"
-                )
-            else:
-                self.disconnected_at = None
-
-    def _recover_pass(
-        self,
-        tokens: list[int],
-        since: datetime,
-        until: datetime,
-        generation: int,
-    ) -> list[str]:
-        failures: list[str] = []
-        if self.gateway is None:
-            return failures
-        for token in tokens:
-            if not self.running or self._generation != generation:
-                break
-            try:
-                self._process(self.gateway.completed_candles(token, since, until))
-            except Exception as exc:
-                failures.append(f"{token}: {exc}")
-        return failures
+        self._process_reliably(candles)
 
     def _record_error(self, message: str) -> None:
         with self._lock:
@@ -493,6 +401,7 @@ class LiveMonitor:
             self.disconnected_at = self.disconnected_at or datetime.now(IST)
             if self.running:
                 self.last_error = f"WebSocket closed ({code}): {reason}"
+        self._connection_lost()
 
     def _on_error(self, ws: Any, code: int, reason: str) -> None:
         self._record_error(f"Zerodha WebSocket error ({code}): {reason}")
@@ -505,6 +414,7 @@ class LiveMonitor:
         with self._lock:
             self.connected = False
             self.last_error = "Zerodha WebSocket reconnect limit reached. Restart the app."
+        self._connection_lost()
 
 
 def create_daily_rule(
@@ -520,7 +430,41 @@ def create_daily_rule(
     token: int | str = instrument["instrument_token"]
     if gateway.provider == "zerodha":
         token = int(token)
-    reference_date, reference_close = gateway.previous_session_close(token, trading_date)
+    history: list[Candle] = []
+    history_error: Exception | None = None
+    historical_method = getattr(gateway, "historical_candles", None)
+    if callable(historical_method):
+        try:
+            history = historical_method(
+                token,
+                datetime.combine(
+                    trading_date - timedelta(days=28), datetime.min.time()
+                ),
+                datetime.combine(trading_date, datetime.min.time()),
+            )
+        except Exception as exc:
+            history_error = exc
+            logger.warning(
+                "%s stop-history preload failed for %s:%s: %s",
+                gateway.provider.title(),
+                exchange,
+                tradingsymbol,
+                exc,
+            )
+    eligible = [candle for candle in history if candle.start.date() < trading_date]
+    if eligible:
+        store.save_market_candles(gateway.provider, history)
+        final_candle = max(eligible, key=lambda value: value.start)
+        reference_date, reference_close = final_candle.start.date(), final_candle.close
+    else:
+        try:
+            reference_date, reference_close = gateway.previous_session_close(
+                token, trading_date
+            )
+        except Exception:
+            if history_error is not None:
+                raise history_error
+            raise
     upper, lower = calculate_levels(reference_close, percentage)
     rule_id = store.upsert_rule(
         exchange=exchange,

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
 
-from .domain import Candle, calculate_levels, display_price
+from .domain import Candle, calculate_levels, display_price, ensure_ist
+from .stop_loss import calculate_stop_loss, fallback_stop_loss
+
+logger = logging.getLogger(__name__)
 
 
 class Store:
@@ -64,10 +68,46 @@ class Store:
                     candle_low TEXT NOT NULL,
                     candle_close TEXT NOT NULL,
                     threshold TEXT NOT NULL,
+                    trade_side TEXT,
+                    entry_price TEXT,
+                    stop_loss TEXT,
+                    risk_amount TEXT,
+                    risk_percent TEXT,
+                    stop_method TEXT,
+                    stop_confidence TEXT,
+                    backtest_samples INTEGER,
+                    validation_samples INTEGER,
+                    validation_win_rate TEXT,
+                    validation_average_r TEXT,
+                    atr TEXT,
+                    atr_multiplier TEXT,
+                    swing_reference TEXT,
+                    stop_explanation TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(rule_id, direction, candle_start),
                     FOREIGN KEY(rule_id) REFERENCES rules(id)
                 );
+                CREATE TABLE IF NOT EXISTS candle_checkpoints (
+                    provider TEXT NOT NULL,
+                    instrument_token TEXT NOT NULL,
+                    trading_date TEXT NOT NULL,
+                    last_candle_end TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(provider, instrument_token, trading_date)
+                );
+                CREATE TABLE IF NOT EXISTS market_candles (
+                    provider TEXT NOT NULL,
+                    instrument_token TEXT NOT NULL,
+                    candle_start TEXT NOT NULL,
+                    candle_end TEXT NOT NULL,
+                    candle_open TEXT NOT NULL,
+                    candle_high TEXT NOT NULL,
+                    candle_low TEXT NOT NULL,
+                    candle_close TEXT NOT NULL,
+                    PRIMARY KEY(provider, instrument_token, candle_start)
+                );
+                CREATE INDEX IF NOT EXISTS idx_market_candles_lookup
+                    ON market_candles(provider, instrument_token, candle_end);
                 """
             )
             columns = {
@@ -78,6 +118,32 @@ class Store:
                 connection.execute(
                     "ALTER TABLE rules ADD COLUMN provider TEXT NOT NULL DEFAULT 'zerodha'"
                 )
+            event_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(events)").fetchall()
+            }
+            additions = {
+                "trade_side": "TEXT",
+                "entry_price": "TEXT",
+                "stop_loss": "TEXT",
+                "risk_amount": "TEXT",
+                "risk_percent": "TEXT",
+                "stop_method": "TEXT",
+                "stop_confidence": "TEXT",
+                "backtest_samples": "INTEGER",
+                "validation_samples": "INTEGER",
+                "validation_win_rate": "TEXT",
+                "validation_average_r": "TEXT",
+                "atr": "TEXT",
+                "atr_multiplier": "TEXT",
+                "swing_reference": "TEXT",
+                "stop_explanation": "TEXT",
+            }
+            for name, data_type in additions.items():
+                if name not in event_columns:
+                    connection.execute(
+                        f"ALTER TABLE events ADD COLUMN {name} {data_type}"
+                    )
 
     def upsert_rule(
         self,
@@ -109,8 +175,24 @@ class Store:
                     reference_close = excluded.reference_close,
                     upper_level = excluded.upper_level,
                     lower_level = excluded.lower_level,
-                    upper_sent = 0,
-                    lower_sent = 0,
+                    upper_sent = CASE
+                        WHEN rules.provider = excluded.provider
+                         AND CAST(rules.instrument_token AS TEXT) = CAST(excluded.instrument_token AS TEXT)
+                         AND CAST(rules.percentage AS NUMERIC) = CAST(excluded.percentage AS NUMERIC)
+                         AND rules.reference_date = excluded.reference_date
+                         AND CAST(rules.reference_close AS NUMERIC) = CAST(excluded.reference_close AS NUMERIC)
+                         AND CAST(rules.upper_level AS NUMERIC) = CAST(excluded.upper_level AS NUMERIC)
+                         AND CAST(rules.lower_level AS NUMERIC) = CAST(excluded.lower_level AS NUMERIC)
+                        THEN rules.upper_sent ELSE 0 END,
+                    lower_sent = CASE
+                        WHEN rules.provider = excluded.provider
+                         AND CAST(rules.instrument_token AS TEXT) = CAST(excluded.instrument_token AS TEXT)
+                         AND CAST(rules.percentage AS NUMERIC) = CAST(excluded.percentage AS NUMERIC)
+                         AND rules.reference_date = excluded.reference_date
+                         AND CAST(rules.reference_close AS NUMERIC) = CAST(excluded.reference_close AS NUMERIC)
+                         AND CAST(rules.upper_level AS NUMERIC) = CAST(excluded.upper_level AS NUMERIC)
+                         AND CAST(rules.lower_level AS NUMERIC) = CAST(excluded.lower_level AS NUMERIC)
+                        THEN rules.lower_sent ELSE 0 END,
                     active = 1,
                     created_at = excluded.created_at,
                     provider = excluded.provider
@@ -216,12 +298,156 @@ class Store:
             )
         return self.get_rule(rule_id)
 
+    def save_market_candles(
+        self, provider: str, candles: list[Candle]
+    ) -> int:
+        """Persist broker history so stop calculations never wait on an alert."""
+        if not candles:
+            return 0
+        with self._lock, self.connection() as connection:
+            for candle in candles:
+                self._save_market_candle(connection, provider, candle)
+        return len(candles)
+
+    @staticmethod
+    def _save_market_candle(
+        connection: sqlite3.Connection, provider: str, candle: Candle
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO market_candles (
+                provider, instrument_token, candle_start, candle_end,
+                candle_open, candle_high, candle_low, candle_close
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, instrument_token, candle_start) DO UPDATE SET
+                candle_end=excluded.candle_end,
+                candle_open=excluded.candle_open,
+                candle_high=excluded.candle_high,
+                candle_low=excluded.candle_low,
+                candle_close=excluded.candle_close
+            """,
+            (
+                provider,
+                str(candle.instrument_token),
+                ensure_ist(candle.start).isoformat(),
+                ensure_ist(candle.end).isoformat(),
+                str(candle.open),
+                str(candle.high),
+                str(candle.low),
+                str(candle.close),
+            ),
+        )
+
+    @staticmethod
+    def _market_candles_through(
+        connection: sqlite3.Connection,
+        provider: str,
+        instrument_token: int | str,
+        candle_end: datetime,
+    ) -> list[Candle]:
+        rows = connection.execute(
+            """
+            SELECT * FROM market_candles
+            WHERE provider=? AND instrument_token=?
+              AND candle_end>=? AND candle_end<=?
+            ORDER BY candle_start ASC
+            """,
+            (
+                provider,
+                str(instrument_token),
+                (ensure_ist(candle_end) - timedelta(days=28)).isoformat(),
+                ensure_ist(candle_end).isoformat(),
+            ),
+        ).fetchall()
+        return [
+            Candle.from_ohlc(
+                instrument_token=instrument_token,
+                start=datetime.fromisoformat(row["candle_start"]),
+                end=datetime.fromisoformat(row["candle_end"]),
+                open=Decimal(row["candle_open"]),
+                high=Decimal(row["candle_high"]),
+                low=Decimal(row["candle_low"]),
+                close=Decimal(row["candle_close"]),
+            )
+            for row in rows
+        ]
+
+    def candle_checkpoint(
+        self, provider: str, instrument_token: int | str, trading_date: date
+    ) -> datetime | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT last_candle_end FROM candle_checkpoints
+                   WHERE provider=? AND instrument_token=? AND trading_date=?""",
+                (provider, str(instrument_token), trading_date.isoformat()),
+            ).fetchone()
+        if row is None:
+            return None
+        return ensure_ist(datetime.fromisoformat(row["last_candle_end"]))
+
+    def advance_candle_checkpoint(
+        self,
+        provider: str,
+        instrument_token: int | str,
+        trading_date: date,
+        candle_end: datetime,
+    ) -> None:
+        with self._lock, self.connection() as connection:
+            self._advance_candle_checkpoint(
+                connection, provider, instrument_token, trading_date, candle_end
+            )
+
+    @staticmethod
+    def _advance_candle_checkpoint(
+        connection: sqlite3.Connection,
+        provider: str,
+        instrument_token: int | str,
+        trading_date: date,
+        candle_end: datetime,
+    ) -> None:
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        connection.execute(
+            """
+            INSERT INTO candle_checkpoints (
+                provider, instrument_token, trading_date, last_candle_end, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(provider, instrument_token, trading_date) DO UPDATE SET
+                last_candle_end = excluded.last_candle_end,
+                updated_at = excluded.updated_at
+            WHERE excluded.last_candle_end > candle_checkpoints.last_candle_end
+            """,
+            (
+                provider,
+                str(instrument_token),
+                trading_date.isoformat(),
+                ensure_ist(candle_end).isoformat(),
+                now,
+            ),
+        )
+
     def evaluate_candle(
-        self, candle: Candle, provider: str = "zerodha"
+        self,
+        candle: Candle,
+        provider: str = "zerodha",
+        *,
+        update_checkpoint: bool = True,
     ) -> list[dict[str, Any]]:
         trading_date = candle.start.date()
         created: list[dict[str, Any]] = []
         with self._lock, self.connection() as connection:
+            if update_checkpoint:
+                checkpoint = connection.execute(
+                    """SELECT last_candle_end FROM candle_checkpoints
+                       WHERE provider=? AND instrument_token=? AND trading_date=?""",
+                    (provider, str(candle.instrument_token), trading_date.isoformat()),
+                ).fetchone()
+                if checkpoint is not None:
+                    last_end = ensure_ist(
+                        datetime.fromisoformat(checkpoint["last_candle_end"])
+                    )
+                    if candle.end <= last_end:
+                        return []
+            self._save_market_candle(connection, provider, candle)
             rows = connection.execute(
                 """SELECT * FROM rules WHERE trading_date=? AND instrument_token=?
                    AND provider=? AND active=1""",
@@ -240,6 +466,26 @@ class Store:
                     )
                     if already_sent or not crossed:
                         continue
+                    try:
+                        history = self._market_candles_through(
+                            connection, provider, candle.instrument_token, candle.end
+                        )
+                        stop = calculate_stop_loss(
+                            history=history,
+                            alert_candle=candle,
+                            percentage=Decimal(row["percentage"]),
+                            direction=direction,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Stop calibration failed for %s rule %s",
+                            provider,
+                            row["id"],
+                        )
+                        stop = fallback_stop_loss(
+                            alert_candle=candle,
+                            direction=direction,
+                        )
                     now = datetime.now(UTC).isoformat(timespec="seconds")
                     try:
                         cursor = connection.execute(
@@ -247,8 +493,14 @@ class Store:
                             INSERT INTO events (
                                 rule_id, direction, candle_start, candle_end,
                                 candle_open, candle_high, candle_low, candle_close,
-                                threshold, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                threshold, trade_side, entry_price, stop_loss,
+                                risk_amount, risk_percent, stop_method,
+                                stop_confidence, backtest_samples,
+                                validation_samples, validation_win_rate,
+                                validation_average_r, atr, atr_multiplier,
+                                swing_reference, stop_explanation, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 row["id"],
@@ -260,6 +512,29 @@ class Store:
                                 str(candle.low),
                                 str(candle.close),
                                 str(threshold),
+                                stop.trade_side,
+                                str(stop.entry_price),
+                                str(stop.stop_price),
+                                str(stop.risk_amount),
+                                str(stop.risk_percent),
+                                stop.method,
+                                stop.confidence,
+                                stop.backtest_samples,
+                                stop.validation_samples,
+                                (
+                                    str(stop.validation_win_rate)
+                                    if stop.validation_win_rate is not None
+                                    else None
+                                ),
+                                (
+                                    str(stop.validation_average_r)
+                                    if stop.validation_average_r is not None
+                                    else None
+                                ),
+                                str(stop.atr),
+                                str(stop.atr_multiplier),
+                                str(stop.swing_reference),
+                                stop.explanation,
                                 now,
                             ),
                         )
@@ -287,9 +562,50 @@ class Store:
                             "candle_high": str(candle.high),
                             "candle_low": str(candle.low),
                             "candle_close": str(candle.close),
+                            "trade_side": stop.trade_side,
+                            "entry_price": str(stop.entry_price),
+                            "entry_price_display": display_price(stop.entry_price),
+                            "stop_loss": str(stop.stop_price),
+                            "stop_loss_display": display_price(stop.stop_price),
+                            "risk_amount": str(stop.risk_amount),
+                            "risk_percent": str(stop.risk_percent),
+                            "risk_percent_display": self._display_percent(
+                                stop.risk_percent
+                            ),
+                            "stop_method": stop.method,
+                            "stop_confidence": stop.confidence,
+                            "backtest_samples": stop.backtest_samples,
+                            "validation_samples": stop.validation_samples,
+                            "validation_win_rate": (
+                                str(stop.validation_win_rate)
+                                if stop.validation_win_rate is not None
+                                else None
+                            ),
+                            "validation_win_rate_display": (
+                                self._display_percent(stop.validation_win_rate)
+                                if stop.validation_win_rate is not None
+                                else None
+                            ),
+                            "validation_average_r": (
+                                str(stop.validation_average_r)
+                                if stop.validation_average_r is not None
+                                else None
+                            ),
+                            "atr": str(stop.atr),
+                            "atr_multiplier": str(stop.atr_multiplier),
+                            "swing_reference": str(stop.swing_reference),
+                            "stop_explanation": stop.explanation,
                             "created_at": now,
                         }
                     )
+            if update_checkpoint:
+                self._advance_candle_checkpoint(
+                    connection,
+                    provider,
+                    candle.instrument_token,
+                    trading_date,
+                    candle.end,
+                )
         return created
 
     def latest_event_id(self) -> int:
@@ -325,8 +641,26 @@ class Store:
         for row in rows:
             item = dict(row)
             item["threshold_display"] = display_price(Decimal(item["threshold"]))
+            if item.get("entry_price") is not None:
+                item["entry_price_display"] = display_price(
+                    Decimal(item["entry_price"])
+                )
+            if item.get("stop_loss") is not None:
+                item["stop_loss_display"] = display_price(Decimal(item["stop_loss"]))
+            if item.get("risk_percent") is not None:
+                item["risk_percent_display"] = self._display_percent(
+                    Decimal(item["risk_percent"])
+                )
+            if item.get("validation_win_rate") is not None:
+                item["validation_win_rate_display"] = self._display_percent(
+                    Decimal(item["validation_win_rate"])
+                )
             result.append(item)
         return result
+
+    @staticmethod
+    def _display_percent(value: Decimal) -> str:
+        return f"{value.quantize(Decimal('0.01'))}%"
 
     @staticmethod
     def _rule_dict(row: sqlite3.Row) -> dict[str, Any]:
