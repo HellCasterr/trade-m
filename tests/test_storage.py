@@ -88,6 +88,9 @@ def test_same_candle_is_idempotent(tmp_path) -> None:
     assert len(store.evaluate_candle(crossing)) == 1
     assert store.evaluate_candle(crossing) == []
     assert len(store.events_after()) == 1
+    assert store.latest_event_id() == 1
+    assert len(store.events_after(trading_date=date(2026, 9, 15))) == 1
+    assert store.events_after(trading_date=date(2026, 9, 16)) == []
 
 
 def test_rule_update_resets_directional_state(tmp_path) -> None:

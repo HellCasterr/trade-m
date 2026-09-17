@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Trade M · Three-minute alerts</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=0.7.0">
 </head>
 <body>
   <main class="shell">
@@ -64,7 +64,14 @@
         <p class="kicker">2 · ENABLE</p>
         <h2>Browser notifications</h2>
         <p id="notificationCopy">Allow desktop alerts and keep this page open.</p>
-        <button id="notificationButton" class="button secondary">Enable notifications</button>
+        <div id="deliveryStatus" class="delivery-status warn">
+          <span class="delivery-dot"></span>
+          <span id="deliveryStatusText">Starting live alert channel…</span>
+        </div>
+        <div class="notification-actions">
+          <button id="notificationButton" class="button secondary">Enable notifications</button>
+          <button id="testNotificationButton" class="button secondary" disabled>Test alert</button>
+        </div>
       </article>
     </section>
 
@@ -201,6 +208,6 @@
       <div id="events" class="events-list empty-state">No alerts triggered today.</div>
     </section>
   </main>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=0.7.0" defer></script>
 </body>
 </html>

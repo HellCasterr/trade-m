@@ -49,6 +49,14 @@ h2 { font-size: 1.35rem; margin: 0; letter-spacing: -.025em; }
 .connection-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .card { background: linear-gradient(145deg, rgba(255,255,255,.025), transparent), var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 24px; box-shadow: 0 18px 55px rgba(0,0,0,.16); }
 .card p:not(.kicker) { color: var(--muted); line-height: 1.55; }
+.delivery-status { display: flex; align-items: center; gap: 8px; margin: 13px 0; color: var(--muted); font-size: .78rem; font-weight: 700; }
+.delivery-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--gold); box-shadow: 0 0 0 4px rgba(240,184,90,.08); }
+.delivery-status.good { color: var(--green); }
+.delivery-status.good .delivery-dot { background: var(--green); box-shadow: 0 0 0 4px rgba(64,215,155,.08); }
+.delivery-status.error { color: var(--red); }
+.delivery-status.error .delivery-dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255,107,107,.08); }
+.notification-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.notification-actions .button { flex: 1; padding: 0 12px; }
 .button { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 0 17px; border-radius: 11px; border: 1px solid transparent; text-decoration: none; cursor: pointer; font-weight: 750; }
 .button.primary { color: #07130f; background: var(--green); }
 .button.secondary { color: var(--ink); background: var(--card-2); border-color: var(--line); }

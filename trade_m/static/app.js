@@ -7,6 +7,11 @@ const state = {
   feedIssues: {},
   lastEventId: Number(localStorage.getItem("tradeM.lastEventId") || 0),
   eventsLoaded: false,
+  eventsInitialized: false,
+  eventStream: null,
+  alertChannelConnected: false,
+  eventSyncInFlight: false,
+  lastEventSyncAt: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -19,18 +24,30 @@ function showMessage(text, kind = "info") {
 }
 
 async function api(path, options = {}) {
-  const headers = { ...(options.headers || {}) };
-  if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
-  const response = await fetch(path, {
-    headers,
-    ...options,
-  });
-  if (!response.ok) {
-    let detail = `Request failed (${response.status})`;
-    try { detail = (await response.json()).detail || detail; } catch (_) {}
-    throw new Error(detail);
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const headers = { ...(fetchOptions.headers || {}) };
+  if (!(fetchOptions.body instanceof FormData)) headers["Content-Type"] = "application/json";
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(path, {
+      ...fetchOptions,
+      headers,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      let detail = `Request failed (${response.status})`;
+      try { detail = (await response.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    return response.json();
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("The local server did not respond in time.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return response.json();
 }
 
 function formatTime(iso) {
@@ -182,13 +199,54 @@ function eventBody(event) {
 }
 
 function notifySystem(title, body, tag) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
-  const notification = new Notification(title, { body, tag, requireInteraction: true });
-  notification.onclick = () => window.focus();
+  if (!("Notification" in window) || Notification.permission !== "granted") return false;
+  try {
+    const notification = new Notification(title, { body, tag, requireInteraction: true });
+    notification.onclick = () => window.focus();
+    return true;
+  } catch (error) {
+    state.alertChannelConnected = false;
+    renderDeliveryHealth(`Browser rejected an alert: ${error.message}`, "error");
+    return false;
+  }
 }
 
 function notify(event) {
-  notifySystem(eventTitle(event), eventBody(event), `trade-m-${event.id}`);
+  return notifySystem(eventTitle(event), eventBody(event), `trade-m-${event.id}`);
+}
+
+function renderDeliveryHealth(message = null, forcedKind = null) {
+  const box = $("#deliveryStatus");
+  const text = $("#deliveryStatusText");
+  const button = $("#notificationButton");
+  const testButton = $("#testNotificationButton");
+  const supported = "Notification" in window;
+  const permission = supported ? Notification.permission : "unsupported";
+  let kind = forcedKind;
+  let copy = message;
+
+  if (!copy && !supported) {
+    kind = "error";
+    copy = "This browser does not support desktop alerts.";
+  } else if (!copy && permission === "denied") {
+    kind = "error";
+    copy = "Notifications are blocked in browser site settings.";
+  } else if (!copy && permission !== "granted") {
+    kind = "warn";
+    copy = "Notification permission is required.";
+  } else if (!copy && state.alertChannelConnected) {
+    kind = "good";
+    copy = "Live alert channel connected.";
+  } else if (!copy) {
+    kind = "warn";
+    copy = "Live channel reconnecting; safety backfill is active.";
+  }
+
+  box.className = `delivery-status ${kind || "warn"}`;
+  text.textContent = copy;
+  button.textContent = permission === "granted" ? "Notifications enabled" : "Enable notifications";
+  button.disabled = permission === "granted" || permission === "denied" || !supported;
+  testButton.disabled = permission !== "granted";
 }
 
 function renderEvents() {
@@ -207,25 +265,110 @@ function renderEvents() {
     </article>`).join("");
 }
 
+function saveEventCursor() {
+  localStorage.setItem("tradeM.lastEventId", String(state.lastEventId));
+}
+
+function processEvents(newEvents, { notifyNew = true } = {}) {
+  if (!newEvents.length) return;
+  const delayed = [];
+  for (const event of newEvents) {
+    const eventId = Number(event.id);
+    const unseen = eventId > state.lastEventId;
+    if (!state.events.some(existing => Number(existing.id) === eventId)) {
+      state.events.push(event);
+    }
+    if (notifyNew && unseen) {
+      const age = Date.now() - new Date(event.created_at).getTime();
+      if (Number.isFinite(age) && age > 2 * 60 * 1000) delayed.push(event);
+      else notify(event);
+    }
+    state.lastEventId = Math.max(state.lastEventId, eventId);
+  }
+  saveEventCursor();
+  renderEvents();
+  if (notifyNew && delayed.length) {
+    notifySystem(
+      `Trade M recovered ${delayed.length} missed alert${delayed.length === 1 ? "" : "s"}`,
+      "The live page was interrupted. Open Trade M and review the alert log.",
+      `trade-m-recovered-${state.lastEventId}`,
+    );
+    showMessage(`${delayed.length} older alert${delayed.length === 1 ? " was" : "s were"} recovered after a delivery interruption.`, "warn");
+  }
+}
+
+async function initializeEvents() {
+  try {
+    const snapshot = await api("/api/events/snapshot", { timeoutMs: 8000 });
+    const persistedCursor = state.lastEventId;
+    const latestId = Number(snapshot.latest_id || 0);
+    state.events = snapshot.events || [];
+    state.lastEventId = persistedCursor > latestId ? latestId : persistedCursor;
+    processEvents(state.events, { notifyNew: true });
+    state.lastEventId = Math.max(state.lastEventId, latestId);
+    saveEventCursor();
+    state.eventsLoaded = true;
+  } catch (error) {
+    showMessage(`Alert history sync failed: ${error.message}`, "error");
+  } finally {
+    state.eventsInitialized = true;
+    connectEventStream();
+    syncEventBackfill();
+  }
+}
+
+function connectEventStream() {
+  if (!("EventSource" in window)) {
+    renderDeliveryHealth("Live streaming is unsupported; safety backfill is active.", "warn");
+    return;
+  }
+  if (state.eventStream) state.eventStream.close();
+  const source = new EventSource(`/api/events/stream?after_id=${state.lastEventId}`);
+  state.eventStream = source;
+  source.onopen = () => {
+    state.alertChannelConnected = true;
+    renderDeliveryHealth();
+  };
+  source.addEventListener("alert", (message) => {
+    try {
+      processEvents([JSON.parse(message.data)], { notifyNew: true });
+      state.lastEventSyncAt = new Date();
+    } catch (error) {
+      showMessage(`A live alert could not be read: ${error.message}`, "error");
+    }
+  });
+  source.onerror = () => {
+    state.alertChannelConnected = false;
+    renderDeliveryHealth();
+  };
+}
+
+async function syncEventBackfill() {
+  if (state.eventSyncInFlight) return;
+  state.eventSyncInFlight = true;
+  try {
+    const events = await api(`/api/events?after_id=${state.lastEventId}&limit=500`, {
+      timeoutMs: 6000,
+    });
+    processEvents(events, { notifyNew: true });
+    state.lastEventSyncAt = new Date();
+  } catch (error) {
+    if (!state.alertChannelConnected) {
+      renderDeliveryHealth(`Alert delivery offline: ${error.message}`, "error");
+    }
+  } finally {
+    state.eventSyncInFlight = false;
+  }
+}
+
 async function refresh() {
   try {
-    const eventCursor = state.eventsLoaded ? state.lastEventId : 0;
-    const [status, rules, newEvents] = await Promise.all([
-      api("/api/status"), api("/api/rules"), api(`/api/events?after_id=${eventCursor}`)
+    const [status, rules] = await Promise.all([
+      api("/api/status", { timeoutMs: 8000 }), api("/api/rules", { timeoutMs: 8000 })
     ]);
     renderStatus(status);
     state.rules = rules;
     renderRules();
-    if (newEvents.length) {
-      for (const event of newEvents) {
-        if (!state.events.some(existing => existing.id === event.id)) state.events.push(event);
-        if (event.id > state.lastEventId) notify(event);
-        state.lastEventId = Math.max(state.lastEventId, event.id);
-      }
-      localStorage.setItem("tradeM.lastEventId", String(state.lastEventId));
-      renderEvents();
-    }
-    state.eventsLoaded = true;
   } catch (error) {
     showMessage(error.message, "error");
   }
@@ -268,11 +411,30 @@ $("#notificationButton").addEventListener("click", async () => {
   }
   const permission = await Notification.requestPermission();
   $("#notificationCopy").textContent = permission === "granted"
-    ? "Desktop alerts are enabled. Keep this page open during market hours."
+    ? "Desktop alerts are enabled. Keep this page and the Trade M terminal open."
     : "Notifications were not allowed. Enable them in the browser site settings.";
+  renderDeliveryHealth();
   if (permission === "granted") {
-    new Notification("Trade M is ready", { body: "Live crossing alerts are enabled." });
+    notifySystem(
+      "Trade M is ready",
+      "Live crossing alerts are enabled. If you can see this, browser delivery works.",
+      "trade-m-ready",
+    );
   }
+});
+
+$("#testNotificationButton").addEventListener("click", () => {
+  const delivered = notifySystem(
+    "Trade M test alert",
+    "Browser notification delivery is working.",
+    `trade-m-test-${Date.now()}`,
+  );
+  showMessage(
+    delivered
+      ? "Test alert sent. Confirm that Windows displayed it."
+      : "The browser could not create the test alert.",
+    delivered ? "success" : "error",
+  );
 });
 
 $("#ruleForm").addEventListener("submit", async (event) => {
@@ -364,6 +526,7 @@ $("#addNiftyButton").addEventListener("click", async () => {
     const result = await api("/api/rules/nifty50", {
       method: "POST",
       body: JSON.stringify({ provider, common_percentage: common, percentages }),
+      timeoutMs: 180000,
     });
     const failureNames = result.failures.slice(0, 4).map(item => item.symbol).join(", ");
     const suffix = result.failed ? ` ${result.failed} failed${failureNames ? `: ${failureNames}` : ""}.` : "";
@@ -397,7 +560,9 @@ $("#excelImportForm").addEventListener("submit", async (event) => {
   button.textContent = "Validating & calculating…";
   resultBox.className = "import-result hidden";
   try {
-    const result = await api("/api/rules/import", { method: "POST", body: form });
+    const result = await api("/api/rules/import", {
+      method: "POST", body: form, timeoutMs: 180000,
+    });
     const summary = `${result.created} stock${result.created === 1 ? "" : "s"} added, ${result.failed} failed, ${result.skipped} skipped.`;
     resultBox.replaceChildren();
     const heading = document.createElement("strong");
@@ -472,15 +637,49 @@ if (query.get("login")) {
 }
 history.replaceState({}, "", "/");
 
-if ("Notification" in window && Notification.permission === "granted") {
-  $("#notificationCopy").textContent = "Desktop alerts are enabled. Keep this page open during market hours.";
+if (document.wasDiscarded) {
+  showMessage(
+    "The browser previously discarded the Trade M tab. Disable Memory Saver for 127.0.0.1 so live alerts are not suspended.",
+    "error",
+  );
 }
 
+if ("Notification" in window && Notification.permission === "granted") {
+  $("#notificationCopy").textContent = "Desktop alerts are enabled. Keep this page and the Trade M terminal open.";
+}
+renderDeliveryHealth();
+
 async function refreshLoop() {
-  await refresh();
-  window.setTimeout(refreshLoop, 1000);
+  try {
+    await refresh();
+  } finally {
+    window.setTimeout(refreshLoop, 2500);
+  }
 }
 
 refreshLoop();
+initializeEvents();
 refreshMarketMovement();
 window.setInterval(refreshMarketMovement, 60000);
+window.setInterval(syncEventBackfill, 5000);
+
+function recoverLivePage() {
+  refresh();
+  if (!state.eventsInitialized) return;
+  syncEventBackfill();
+  if (
+    "EventSource" in window
+    && (!state.eventStream || state.eventStream.readyState === EventSource.CLOSED)
+  ) {
+    connectEventStream();
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") recoverLivePage();
+});
+document.addEventListener("resume", recoverLivePage);
+window.addEventListener("focus", recoverLivePage);
+window.addEventListener("online", recoverLivePage);
+window.addEventListener("pageshow", recoverLivePage);
+window.addEventListener("beforeunload", () => state.eventStream?.close());

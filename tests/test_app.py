@@ -28,6 +28,8 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
         assert "Upload stocks from Excel" in dashboard.text
         assert "Download sample Excel" in dashboard.text
         assert "India VIX-based moving percentage" in dashboard.text
+        assert "Starting live alert channel" in dashboard.text
+        assert "Test alert" in dashboard.text
         assert "Sign in with Upstox" in dashboard.text
         assert "Sign in with Dhan" in dashboard.text
 
@@ -41,6 +43,10 @@ def test_dashboard_and_unauthenticated_status(tmp_path: Path) -> None:
 
         assert client.get("/api/rules").json() == []
         assert client.get("/api/events").json() == []
+        snapshot = client.get("/api/events/snapshot").json()
+        assert snapshot["events"] == []
+        assert snapshot["latest_id"] == 0
+        assert any(route.path == "/api/events/stream" for route in app.routes)
 
         movement = client.get("/api/market-movement").json()
         assert movement["available"] is False

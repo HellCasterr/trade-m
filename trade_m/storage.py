@@ -292,16 +292,34 @@ class Store:
                     )
         return created
 
-    def events_after(self, event_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+    def latest_event_id(self) -> int:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) AS id FROM events"
+            ).fetchone()
+        return int(row["id"] if row else 0)
+
+    def events_after(
+        self,
+        event_id: int = 0,
+        limit: int = 100,
+        trading_date: date | None = None,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE e.id>?"
+        params: list[Any] = [event_id]
+        if trading_date is not None:
+            where += " AND r.trading_date=?"
+            params.append(trading_date.isoformat())
+        params.append(limit)
         with self.connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT e.*, r.exchange, r.tradingsymbol, r.percentage,
                        r.reference_close, r.provider
                 FROM events e JOIN rules r ON r.id=e.rule_id
-                WHERE e.id>? ORDER BY e.id ASC LIMIT ?
+                {where} ORDER BY e.id ASC LIMIT ?
                 """,
-                (event_id, limit),
+                params,
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:

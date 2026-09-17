@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -7,8 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -126,7 +128,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.6.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.7.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store
@@ -448,7 +450,54 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         after_id: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> list[dict[str, Any]]:
-        return store.events_after(after_id, limit)
+        return store.events_after(after_id, limit, datetime.now(IST).date())
+
+    @app.get("/api/events/snapshot")
+    def event_snapshot() -> dict[str, Any]:
+        return {
+            "events": store.events_after(0, 500, datetime.now(IST).date()),
+            "latest_id": store.latest_event_id(),
+            "server_time": datetime.now(IST).isoformat(),
+        }
+
+    @app.get("/api/events/stream")
+    async def event_stream(
+        request: Request,
+        after_id: int = Query(default=0, ge=0),
+        last_event_id: int | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        cursor = max(after_id, last_event_id or 0)
+
+        async def generate():
+            nonlocal cursor
+            loop = asyncio.get_running_loop()
+            last_heartbeat = loop.time()
+            yield "retry: 2000\nevent: ready\ndata: {}\n\n"
+            while not await request.is_disconnected():
+                current = store.events_after(
+                    cursor, 100, datetime.now(IST).date()
+                )
+                if current:
+                    for event in current:
+                        cursor = max(cursor, int(event["id"]))
+                        payload = json.dumps(event, separators=(",", ":"))
+                        yield f"id: {event['id']}\nevent: alert\ndata: {payload}\n\n"
+                    last_heartbeat = loop.time()
+                    continue
+                if loop.time() - last_heartbeat >= 15:
+                    yield ": keepalive\n\n"
+                    last_heartbeat = loop.time()
+                await asyncio.sleep(0.75)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 

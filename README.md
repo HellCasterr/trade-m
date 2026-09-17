@@ -139,6 +139,9 @@ The app accepts `.xlsx` files up to 2 MB and at most 200 populated stock rows. I
 
 ## Operational notes
 
+- New alerts use a persistent server-sent event channel instead of depending on the general dashboard refresh. An independent five-second backfill check recovers events missed during a browser or network interruption without creating duplicates.
+- Dashboard requests have timeouts, so a stuck status or rule request cannot stop alert delivery. Returning to the tab, focusing the window, or reconnecting to the network triggers an immediate recovery check.
+- The Browser notifications card displays the live-channel state and provides a **Test alert** button. Use it before market hours and confirm Windows displays the notification; browser permission cannot detect Windows Focus Assist or operating-system notification suppression.
 - The app uses the tick's exchange timestamp when available and falls back to local IST time.
 - A candle is finalized three seconds after its aligned end time by default. Adjust `CANDLE_FINALIZATION_DELAY_SECONDS` in `.env` if required.
 - No synthetic candle is created if an instrument has no ticks during a three-minute interval.
