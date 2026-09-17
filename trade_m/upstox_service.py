@@ -27,6 +27,8 @@ from .storage import Store
 
 logger = logging.getLogger(__name__)
 
+INDIA_VIX_INSTRUMENT_KEY = "NSE_INDEX|India VIX"
+
 
 def _upstox_module() -> Any:
     try:
@@ -181,6 +183,9 @@ class UpstoxGateway:
             )
         timestamp, final_candle = max(eligible, key=lambda value: value[0])
         return timestamp.date(), as_decimal(final_candle[4])
+
+    def india_vix_previous_close(self, trading_date: date) -> tuple[date, Decimal]:
+        return self.previous_session_close(INDIA_VIX_INSTRUMENT_KEY, trading_date)
 
     def completed_candles(
         self, instrument_token: str, since: datetime, until: datetime

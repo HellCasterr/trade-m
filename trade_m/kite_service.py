@@ -153,6 +153,20 @@ class KiteGateway:
         timestamp, final_candle = max(eligible, key=lambda value: value[0])
         return timestamp.date(), as_decimal(final_candle["close"])
 
+    def india_vix_previous_close(self, trading_date: date) -> tuple[date, Decimal]:
+        vix = next(
+            (
+                item
+                for item in self.instruments("NSE")
+                if str(item.get("tradingsymbol", "")).replace(" ", "").upper()
+                == "INDIAVIX"
+            ),
+            None,
+        )
+        if vix is None:
+            raise KiteUnavailable("India VIX was not found in Zerodha's NSE instruments.")
+        return self.previous_session_close(int(vix["instrument_token"]), trading_date)
+
     def completed_candles(
         self, instrument_token: int, since: datetime, until: datetime
     ) -> list[Candle]:

@@ -2,6 +2,16 @@
 
 Trade M is a Windows-friendly, local web application that watches Indian cash-equity prices through Zerodha Kite Connect, Upstox, or DhanHQ and sends browser desktop notifications after a qualifying **completed three-minute candle**.
 
+At the top of the dashboard, Trade M also shows a daily moving percentage based on
+the latest completed India VIX session:
+
+```text
+moving percentage = previous India VIX close / 8.54400
+```
+
+For example, an India VIX close of `12.990` produces `1.5203%`. The value is fetched
+after a market-data provider is connected and cached for the trading day.
+
 It is an alerting tool only. It never places orders.
 
 ## Alert rule

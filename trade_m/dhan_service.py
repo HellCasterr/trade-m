@@ -157,6 +157,7 @@ class DhanGateway:
         self.access_token: str | None = None
         self.user_name: str | None = None
         self._instruments: list[dict[str, Any]] | None = None
+        self._india_vix_security_id: str | None = None
         self._lock = threading.RLock()
         self._last_historical_request = 0.0
 
@@ -307,6 +308,43 @@ class DhanGateway:
             self._instruments = rows
         return rows
 
+    @staticmethod
+    def _index_security_id(row: dict[str, Any], target: str) -> str | None:
+        values = (
+            row.get("SEM_TRADING_SYMBOL"),
+            row.get("SYMBOL_NAME"),
+            row.get("SM_SYMBOL_NAME"),
+            row.get("SEM_CUSTOM_SYMBOL"),
+            row.get("DISPLAY_NAME"),
+        )
+        names = {
+            str(value or "").replace(" ", "").replace("_", "").upper()
+            for value in values
+        }
+        if target.replace(" ", "").upper() not in names:
+            return None
+        security_id = str(
+            row.get("SEM_SMST_SECURITY_ID") or row.get("SECURITY_ID") or ""
+        ).strip()
+        return security_id or None
+
+    def _find_india_vix_security_id(self) -> str:
+        with self._lock:
+            if self._india_vix_security_id is not None:
+                return self._india_vix_security_id
+        try:
+            with urlopen(INSTRUMENTS_URL, timeout=45) as response:
+                text = response.read().decode("utf-8-sig")
+        except (HTTPError, URLError, TimeoutError, UnicodeDecodeError) as exc:
+            raise KiteUnavailable(f"Could not download Dhan's instrument list: {exc}") from exc
+        for row in csv.DictReader(io.StringIO(text)):
+            security_id = self._index_security_id(row, "INDIA VIX")
+            if security_id:
+                with self._lock:
+                    self._india_vix_security_id = security_id
+                return security_id
+        raise KiteUnavailable("India VIX was not found in Dhan's instrument list.")
+
     def search_instruments(self, query: str, exchange: str = "NSE") -> list[dict[str, Any]]:
         self.require_access_token()
         target = query.strip().upper()
@@ -349,6 +387,37 @@ class DhanGateway:
                 "securityId": security_id,
                 "exchangeSegment": segment,
                 "instrument": "EQUITY",
+                "interval": "1",
+                "oi": False,
+                "fromDate": f"{trading_date - timedelta(days=14)} 09:15:00",
+                "toDate": f"{trading_date} 00:00:00",
+            }
+        ).encode()
+        request = Request(
+            f"{API_URL}/charts/intraday",
+            data=body,
+            method="POST",
+            headers={
+                "access-token": self.require_access_token(),
+                "client-id": self.client_id,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        return previous_close_from_intraday(self._request_json(request), trading_date)
+
+    def india_vix_previous_close(self, trading_date: date) -> tuple[date, Decimal]:
+        security_id = self._find_india_vix_security_id()
+        with self._lock:
+            wait = 0.22 - (time_module.monotonic() - self._last_historical_request)
+            if wait > 0:
+                time_module.sleep(wait)
+            self._last_historical_request = time_module.monotonic()
+        body = json.dumps(
+            {
+                "securityId": security_id,
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
                 "interval": "1",
                 "oi": False,
                 "fromDate": f"{trading_date - timedelta(days=14)} 09:15:00",

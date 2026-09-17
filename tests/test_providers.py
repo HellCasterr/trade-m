@@ -1,3 +1,4 @@
+import json
 import struct
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -12,7 +13,7 @@ from trade_m.dhan_service import (
     previous_close_from_intraday,
 )
 from trade_m.domain import IST
-from trade_m.kite_service import LiveMonitor
+from trade_m.kite_service import KiteGateway, LiveMonitor
 from trade_m.storage import Store
 from trade_m.upstox_service import UpstoxGateway, UpstoxMonitor
 import trade_m.upstox_service as upstox_service
@@ -43,6 +44,23 @@ def test_zerodha_subscriptions_are_batched(tmp_path) -> None:
     monitor.connected = True
     monitor.subscribe(list(range(1, 1202)))
     assert [len(batch) for batch in ticker.subscriptions] == [500, 500, 201]
+
+
+def test_zerodha_india_vix_resolves_index_instrument(monkeypatch) -> None:
+    gateway = KiteGateway("key", "secret")
+    gateway._instruments["NSE"] = [
+        {"tradingsymbol": "INDIA VIX", "instrument_token": 264969}
+    ]
+    captured = {}
+
+    def previous_close(token, trading_date):
+        captured["token"] = token
+        return date(2026, 9, 16), Decimal("12.990")
+
+    monkeypatch.setattr(gateway, "previous_session_close", previous_close)
+    result = gateway.india_vix_previous_close(date(2026, 9, 17))
+    assert captured["token"] == 264969
+    assert result == (date(2026, 9, 16), Decimal("12.990"))
 
 
 def test_upstox_instrument_record_is_normalised() -> None:
@@ -151,6 +169,20 @@ def test_upstox_recovery_uses_intraday_v3(monkeypatch) -> None:
     assert candles[0].crossed_down(Decimal("370.422360"))
 
 
+def test_upstox_india_vix_uses_index_instrument_key(monkeypatch) -> None:
+    gateway = UpstoxGateway("key", "secret", "http://localhost/callback")
+    captured = {}
+
+    def previous_close(token, trading_date):
+        captured["token"] = token
+        return date(2026, 9, 16), Decimal("12.990")
+
+    monkeypatch.setattr(gateway, "previous_session_close", previous_close)
+    result = gateway.india_vix_previous_close(date(2026, 9, 17))
+    assert captured["token"] == "NSE_INDEX|India VIX"
+    assert result == (date(2026, 9, 16), Decimal("12.990"))
+
+
 def test_dhan_token_round_trip_and_instrument_normalisation() -> None:
     token = encode_instrument("NSE_EQ", "1333")
     assert token == "NSE_EQ|1333"
@@ -169,6 +201,13 @@ def test_dhan_token_round_trip_and_instrument_normalisation() -> None:
     assert result is not None
     assert result["tradingsymbol"] == "HDFCBANK"
     assert result["instrument_token"] == "NSE_EQ|1333"
+    assert DhanGateway._index_security_id(
+        {
+            "SEM_TRADING_SYMBOL": "INDIA VIX",
+            "SEM_SMST_SECURITY_ID": "21",
+        },
+        "INDIA VIX",
+    ) == "21"
 
 
 def test_dhan_subscription_messages_are_batched_at_100(tmp_path) -> None:
@@ -210,6 +249,32 @@ def test_dhan_history_uses_final_aligned_three_minute_close() -> None:
         date(2026, 9, 15),
     )
     assert result == (date(2026, 9, 14), Decimal("365.2"))
+
+
+def test_dhan_india_vix_uses_index_history_payload(monkeypatch) -> None:
+    gateway = DhanGateway("client", "", "", "token")
+    gateway.access_token = "token"
+    captured = {}
+
+    def epoch(hour: int, minute: int) -> int:
+        value = datetime(2026, 9, 16, hour, minute, tzinfo=IST)
+        return int(value.astimezone(UTC).timestamp())
+
+    def request_json(request):
+        captured.update(json.loads(request.data.decode()))
+        return {
+            "timestamp": [epoch(15, 27), epoch(15, 28), epoch(15, 29)],
+            "close": [12.95, 12.97, 12.99],
+        }
+
+    monkeypatch.setattr(gateway, "_find_india_vix_security_id", lambda: "21")
+    monkeypatch.setattr(gateway, "_request_json", request_json)
+    result = gateway.india_vix_previous_close(date(2026, 9, 17))
+
+    assert captured["securityId"] == "21"
+    assert captured["exchangeSegment"] == "IDX_I"
+    assert captured["instrument"] == "INDEX"
+    assert result == (date(2026, 9, 16), Decimal("12.99"))
 
 
 def test_dhan_recovery_builds_directional_three_minute_candle() -> None:

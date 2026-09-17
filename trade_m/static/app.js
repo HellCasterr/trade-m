@@ -107,6 +107,32 @@ function renderStatus(status) {
   }
 }
 
+function renderMarketMovement(metric) {
+  const value = $("#movementPercentage");
+  const status = $("#movementStatus");
+  const close = $("#vixClose");
+  const banner = document.querySelector(".movement-banner");
+  if (!metric.available) {
+    value.textContent = "—";
+    close.textContent = "—";
+    status.textContent = metric.error || "India VIX data is unavailable.";
+    banner.classList.remove("available");
+    return;
+  }
+  value.textContent = metric.moving_percentage_display;
+  close.textContent = metric.vix_close_display;
+  status.textContent = `${metric.reference_date} close · ${providerTitle(metric.provider)}`;
+  banner.classList.add("available");
+}
+
+async function refreshMarketMovement() {
+  try {
+    renderMarketMovement(await api("/api/market-movement"));
+  } catch (error) {
+    renderMarketMovement({ available: false, error: error.message });
+  }
+}
+
 function renderRules() {
   const container = $("#rules");
   if (!state.rules.length) {
@@ -456,3 +482,5 @@ async function refreshLoop() {
 }
 
 refreshLoop();
+refreshMarketMovement();
+window.setInterval(refreshMarketMovement, 60000);

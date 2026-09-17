@@ -17,6 +17,7 @@ from .dhan_service import DhanGateway, DhanMonitor
 from .domain import IST, SESSION_CLOSE, SESSION_OPEN
 from .excel_import import StockWorkbookError, parse_stock_workbook
 from .kite_service import KiteGateway, KiteUnavailable, LiveMonitor, create_daily_rule
+from .market_metrics import MarketMovementService
 from .nifty50 import Nifty50Service
 from .storage import Store
 from .upstox_service import UpstoxGateway, UpstoxMonitor
@@ -99,6 +100,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         ),
     }
     nifty50 = Nifty50Service()
+    market_movement = MarketMovementService()
 
     def provider_objects(provider: str) -> tuple[Any, Any]:
         key = provider.strip().lower()
@@ -124,13 +126,14 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             monitor.stop()
 
     app = FastAPI(
-        title="Trade M", version="0.5.0", docs_url="/api/docs", lifespan=lifespan
+        title="Trade M", version="0.6.0", docs_url="/api/docs", lifespan=lifespan
     )
     app.state.settings = settings
     app.state.store = store
     app.state.gateways = gateways
     app.state.monitors = monitors
     app.state.nifty50 = nifty50
+    app.state.market_movement = market_movement
 
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -271,6 +274,11 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=502, detail=f"{provider.title()} instrument lookup failed: {exc}"
             ) from exc
+
+    @app.get("/api/market-movement")
+    def daily_market_movement() -> dict[str, Any]:
+        now = datetime.now(IST)
+        return market_movement.get(now.date(), gateways, now=now)
 
     @app.get("/api/nifty50")
     def nifty_constituents(refresh: bool = False) -> dict[str, Any]:
